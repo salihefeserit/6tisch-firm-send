@@ -129,9 +129,14 @@ PROCESS_THREAD(node_process, ev, data)
   /* ------------------------------------------------------------------
    * Device role determination:
    *   node_id == 1  →  Coordinator (TSCH coordinator + RPL root + UDP client)
-   *                    Sends "Hello World!" to every node in routing table.
+   *                    Built with NODEID=1 → uses software-assigned address.
    *   node_id != 1  →  Sensor-node (UDP server)
-   *                    Waits and logs messages from the coordinator.
+   *                    Built WITHOUT NODEID → each device uses its unique
+   *                    factory-programmed IEEE EUI-64 hardware address.
+   *                    node_id is derived from the last 2 bytes of the MAC
+   *                    address at runtime, so it will never equal 1
+   *                    (unless the hardware MAC ends in 0x0001, which is
+   *                    extremely unlikely for production devices).
    * ------------------------------------------------------------------ */
   if(node_id == 1) {
     LOG_INFO("This device is COORDINATOR (node_id=1).\n");

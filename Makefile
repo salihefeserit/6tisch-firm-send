@@ -16,11 +16,18 @@ CONTIKI=../../..
 # ---------------------------------------------------------------
 # Convenience targets:
 #   make coordinator   -> node_id=1 binary (coordinator.bin)
-#   make sensor-node   -> node_id=2 binary (sensor-node.bin)
+#   make sensor-node   -> sensor-node binary WITHOUT fixed NODEID
+#
+# IMPORTANT: sensor-node is built WITHOUT NODEID so that each physical
+# device uses its own factory-programmed IEEE EUI-64 hardware address.
+# Flashing the same sensor-node.bin to multiple boards is safe —
+# each will have a unique link-layer address and IPv6 address.
+# The coordinator is the only device that needs NODEID=1 (to trigger
+# root_start() via the node_id == 1 check in node.c).
 # ---------------------------------------------------------------
 
 coordinator:
-	$(MAKE) distclean 2>/dev/null; $(MAKE) NODEID=1 SUPPORTS_PROP_MODE=0
+	$(MAKE) distclean 2>/dev/null; $(MAKE) NODEID=1 MAKE_WITH_ORCHESTRA=1 SUPPORTS_PROP_MODE=0
 	@BUILT=$$(find build -name "node.simplelink" | head -1); \
 	if [ -n "$$BUILT" ]; then \
 	  cp "$$BUILT" coordinator.bin; \
@@ -30,19 +37,21 @@ coordinator:
 	fi
 
 sensor-node:
-	$(MAKE) distclean 2>/dev/null; $(MAKE) NODEID=2 SUPPORTS_PROP_MODE=0
+	$(MAKE) distclean 2>/dev/null; $(MAKE) MAKE_WITH_ORCHESTRA=1 SUPPORTS_PROP_MODE=0
 	@BUILT=$$(find build -name "node.simplelink" | head -1); \
 	if [ -n "$$BUILT" ]; then \
 	  cp "$$BUILT" sensor-node.bin; \
-	  echo ">>> Node binary hazir: sensor-node.bin"; \
+	  echo ">>> Sensor-node binary hazir: sensor-node.bin"; \
+	  echo ">>> (Her cihazda ayni binary kullanilabilir - donanim MAC adresi benzersizdir)"; \
 	else \
 	  echo "HATA: Binary bulunamadi!"; exit 1; \
 	fi
 
 .PHONY: coordinator sensor-node
 
- # force Orchestra from command line
-MAKE_WITH_ORCHESTRA ?= 0
+# Orchestra: adds dedicated per-neighbor TX/RX slots (avoids queue overflow
+# caused by the single shared slot in the minimal TSCH schedule)
+MAKE_WITH_ORCHESTRA ?= 1
 # force Security from command line
 MAKE_WITH_SECURITY ?= 0
  # print #routes periodically, used for regression tests

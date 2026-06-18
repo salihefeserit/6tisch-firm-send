@@ -84,8 +84,6 @@
 /* 6TiSCH minimal schedule length. */
 #define TSCH_SCHEDULE_CONF_DEFAULT_LENGTH 3
 
-#define TSCH_CONF_DEFAULT_HOPPING_SEQUENCE TSCH_HOPPING_SEQUENCE_1_1
-
 /* Shorten the EB (Enhanced Beacon) transmission period:
  * More frequent EB → nodes synchronize faster (in seconds). */
 #define TSCH_CONF_EB_PERIOD (2 * CLOCK_SECOND)
