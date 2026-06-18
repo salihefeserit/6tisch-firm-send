@@ -29,15 +29,18 @@
 /**
  * \file
  *   6TiSCH dual-role node:
- *     - node_id == 1  → TSCH coordinator + RPL DAG Root + UDP server
- *                        (It receives the "Hello World!" message from the
- * sensor nodes)
- *     - node_id != 1  → 6TiSCH sensor-node + UDP client
- *                        (It sends the "Hello World!" message to the
- * coordinator when TSCH and RPL are ready)
+ *     - node_id == 1  → TSCH coordinator + RPL DAG Root + UDP client
+ *                        (It periodically sends "Hello World!" to every
+ *                         sensor node listed in the RPL routing table)
+ *     - node_id != 1  → 6TiSCH sensor-node + UDP server
+ *                        (It listens on UDP_PORT and logs every message
+ *                         received from the coordinator)
+ *
+ * NOTE: Requires RPL storing mode (MAKE_WITH_STORING_ROUTING=1) so that
+ *       the coordinator populates its routing table with sensor-node routes.
  *
  * \author Simon Duquennoy <simonduq@sics.se>
- *         (Periodic UDP messaging added)
+ *         (Coordinator-to-node periodic UDP messaging)
  */
 
 #include "contiki.h"
@@ -47,6 +50,7 @@
 #include "net/mac/tsch/tsch.h"
 #include "net/netstack.h"
 #include "net/routing/routing.h"
+#include "services/simple-energest/simple-energest.h"
 #include "sys/log.h"
 #include "sys/node-id.h"
 #include <string.h>
@@ -73,20 +77,23 @@ static struct simple_udp_connection udp_conn;
 
 /*---------------------------------------------------------------------------*/
 /*
- * UDP receive callback — works on the coordinator side.
- * It logs the received message and the sender's address.
+ * UDP receive callback — runs on the sensor-node side.
+ * Logs every message received from the coordinator.
  */
-static void udp_rx_callback(struct simple_udp_connection *c,
-                            const uip_ipaddr_t *sender_addr,
-                            uint16_t sender_port,
-                            const uip_ipaddr_t *receiver_addr,
-                            uint16_t receiver_port, const uint8_t *data,
-                            uint16_t datalen) {
+static void
+udp_rx_callback(struct simple_udp_connection *c,
+                const uip_ipaddr_t *sender_addr,
+                uint16_t sender_port,
+                const uip_ipaddr_t *receiver_addr,
+                uint16_t receiver_port,
+                const uint8_t *data,
+                uint16_t datalen)
+{
   LOG_INFO("Message received [%u bytes]: %.*s\n", datalen, datalen,
            (char *)data);
-  if (datalen == strlen(MSG_PAYLOAD) &&
-      memcmp(data, MSG_PAYLOAD, datalen) == 0) {
-    LOG_INFO("Hello World! received\n");
+  if(datalen == strlen(MSG_PAYLOAD) &&
+     memcmp(data, MSG_PAYLOAD, datalen) == 0) {
+    LOG_INFO("Hello World! received from coordinator\n");
   }
   LOG_INFO("Sender: ");
   LOG_INFO_6ADDR(sender_addr);
@@ -95,83 +102,100 @@ static void udp_rx_callback(struct simple_udp_connection *c,
 
 /*---------------------------------------------------------------------------*/
 /*
- * Two conditions are required for the sensor-node side to send application
- * data: TSCH association, then RPL DODAG/root address.
+ * Returns true when the coordinator's TSCH is associated and the RPL
+ * routing table contains at least one sensor-node entry.
+ * (Requires RPL storing mode so uip_ds6_route_head() is populated.)
  */
-static int network_ready_to_send_to_root(uip_ipaddr_t *root_addr) {
-  return tsch_is_associated && NETSTACK_ROUTING.node_is_reachable() &&
-         NETSTACK_ROUTING.get_root_ipaddr(root_addr);
+static int
+coordinator_has_routes(void)
+{
+  return tsch_is_associated &&
+         (uip_ds6_route_head() != NULL);
 }
 
 /*---------------------------------------------------------------------------*/
-PROCESS_THREAD(node_process, ev, data) {
+PROCESS_THREAD(node_process, ev, data)
+{
   static struct etimer send_timer;
   static uint32_t seq = 0;
   static char buf[64];
-  uip_ipaddr_t dest_ipaddr;
+  uip_ds6_route_t *route;
 
   PROCESS_BEGIN();
 
+  /* Simple Energest Monitoring */
+  simple_energest_init();
+
   /* ------------------------------------------------------------------
    * Device role determination:
-   *   node_id == 1  →  Coordinator (TSCH coordinator + RPL root + UDP server)
-   *   node_id != 1  →  Normal 6TiSCH sensor-node (UDP client)
-   *
+   *   node_id == 1  →  Coordinator (TSCH coordinator + RPL root + UDP client)
+   *                    Sends "Hello World!" to every node in routing table.
+   *   node_id != 1  →  Sensor-node (UDP server)
+   *                    Waits and logs messages from the coordinator.
    * ------------------------------------------------------------------ */
-  if (node_id == 1) {
+  if(node_id == 1) {
     LOG_INFO("This device is COORDINATOR (node_id=1).\n");
     /* Tell TSCH that this device is the coordinator — before MAC starts */
     NETSTACK_ROUTING.root_start();
   } else {
-    LOG_INFO("This device is SENSOR-NODE (node_id=%u). Connecting to "
-             "coordinator...\n",
-             node_id);
+    LOG_INFO("This device is SENSOR-NODE (node_id=%u). "
+             "Waiting for coordinator...\n", node_id);
   }
 
   /* Start TSCH MAC layer */
   NETSTACK_MAC.on();
 
-  /* Register UDP socket */
+  /* Register UDP socket (RX callback active on sensor-nodes only) */
   simple_udp_register(&udp_conn, UDP_PORT, NULL, UDP_PORT, udp_rx_callback);
 
   /* ------------------------------------------------------------------
-   * The sensor-node periodically sends a message to the coordinator.
-   * The coordinator logs only the message received via UDP receive callback.
+   * COORDINATOR: periodically send "Hello World!" to every known
+   *              sensor-node found in the RPL routing table.
+   *
+   * SENSOR-NODE: idle — the udp_rx_callback handles incoming messages.
+   *
+   * NOTE: RPL storing mode must be enabled (MAKE_WITH_STORING_ROUTING=1)
+   *       so the coordinator builds a per-node routing table.
    * ------------------------------------------------------------------ */
-  if (node_id != 1) {
-    LOG_INFO("Waiting for TSCH synchronization and RPL DODAG...\n");
-    while (!network_ready_to_send_to_root(&dest_ipaddr)) {
+  if(node_id == 1) {
+    LOG_INFO("Waiting for TSCH association and first sensor-node route...\n");
+
+    /* Wait until at least one sensor-node has joined */
+    while(!coordinator_has_routes()) {
       PROCESS_PAUSE();
     }
 
-    LOG_INFO("Coordinator root address found: ");
-    LOG_INFO_6ADDR(&dest_ipaddr);
-    LOG_INFO_("\n");
-
+    LOG_INFO("First sensor-node route detected. Starting periodic send.\n");
     etimer_set(&send_timer, SEND_INTERVAL);
 
-    while (1) {
+    while(1) {
       PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&send_timer));
       etimer_reset(&send_timer);
 
-      if (network_ready_to_send_to_root(&dest_ipaddr)) {
+      if(!tsch_is_associated) {
+        LOG_INFO("TSCH not associated, send skipped.\n");
+        continue;
+      }
 
-        seq++;
-        snprintf(buf, sizeof(buf), "%s", MSG_PAYLOAD);
+      seq++;
+      snprintf(buf, sizeof(buf), "%s", MSG_PAYLOAD);
 
-        LOG_INFO("Sending to coordinator -> ");
-        LOG_INFO_6ADDR(&dest_ipaddr);
+      /* Iterate over every route and unicast to each sensor-node */
+      for(route = uip_ds6_route_head();
+          route != NULL;
+          route = uip_ds6_route_next(route)) {
+
+        LOG_INFO("Sending to node -> ");
+        LOG_INFO_6ADDR(&route->ipaddr);
         LOG_INFO_(" : \"%s\" [%lu]\n", buf, (unsigned long)seq);
 
-        simple_udp_sendto(&udp_conn, buf, strlen(buf), &dest_ipaddr);
-
-      } else {
-        LOG_INFO("TSCH/RPL not ready, sending delayed...\n");
+        simple_udp_sendto(&udp_conn, buf, strlen(buf), &route->ipaddr);
       }
     }
   }
 
-  while (1) {
+  /* Sensor-node: just keep the process alive — udp_rx_callback does the work */
+  while(1) {
     PROCESS_WAIT_EVENT();
   }
 

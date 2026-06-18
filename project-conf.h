@@ -44,8 +44,11 @@
 #define SICSLOWPAN_CONF_FRAG 0
 #define UIP_CONF_BUFFER_SIZE 240
 
-/* UDP etkinlestir */
+/* UDP enable */
 #define UIP_CONF_UDP 1
+
+/* Energest (sleep mode monitoring) activate */
+#define ENERGEST_CONF_ON 1
 
 /*******************************************************/
 /******** CC1352R1 / LPSTK (SimpleLink) Settings ************/

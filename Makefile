@@ -8,12 +8,15 @@ BOARD ?= sensortag/cc1352r1
 
 PLATFORMS_EXCLUDE = sky native z1
 
+# Simple Energest
+MODULES += $(CONTIKI_NG_SERVICES_DIR)/simple-energest
+
 CONTIKI=../../..
 
 # ---------------------------------------------------------------
-# Kolaylık hedefleri:
-#   make coordinator   -> node_id=1 binary'si (coordinator.bin)
-#   make sensor-node   -> node_id=2 binary'si (sensor-node.bin)
+# Convenience targets:
+#   make coordinator   -> node_id=1 binary (coordinator.bin)
+#   make sensor-node   -> node_id=2 binary (sensor-node.bin)
 # ---------------------------------------------------------------
 
 coordinator:
@@ -44,8 +47,9 @@ MAKE_WITH_ORCHESTRA ?= 0
 MAKE_WITH_SECURITY ?= 0
  # print #routes periodically, used for regression tests
 MAKE_WITH_PERIODIC_ROUTES_PRINT ?= 0
-# RPL storing mode?
-MAKE_WITH_STORING_ROUTING ?= 0
+# RPL storing mode — required for coordinator-to-node downlink
+# (coordinator needs a populated routing table to reach sensor nodes)
+MAKE_WITH_STORING_ROUTING ?= 1
 # Orchestra link-based rule? (Works only if Orchestra & storing mode routing is enabled)
 MAKE_WITH_LINK_BASED_ORCHESTRA ?= 0
 # Use the Orchestra root rule?
