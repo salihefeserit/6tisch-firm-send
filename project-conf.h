@@ -66,11 +66,6 @@
 #undef TSCH_CONF_DEFAULT_TIMESLOT_TIMING
 #define TSCH_CONF_DEFAULT_TIMESLOT_TIMING tsch_timeslot_timing_us_10000
 
-/* Undefine the architecture-specific 50kbps TSCH timing header path so it
- * doesn't conflict */
-#undef TSCH_CONF_ARCH_HDR_PATH
-#define TSCH_CONF_ARCH_HDR_PATH "net/mac/tsch/tsch.h"
-
 /* RF channel: 26 is the default for IEEE 802.15.4 2.4 GHz (channels 11-26) */
 #ifndef IEEE802154_CONF_DEFAULT_CHANNEL
 #define IEEE802154_CONF_DEFAULT_CHANNEL 26

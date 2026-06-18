@@ -20,7 +20,7 @@ CONTIKI=../../..
 # ---------------------------------------------------------------
 
 coordinator:
-	$(MAKE) distclean 2>/dev/null; $(MAKE) NODEID=1
+	$(MAKE) distclean 2>/dev/null; $(MAKE) NODEID=1 SUPPORTS_PROP_MODE=0
 	@BUILT=$$(find build -name "node.simplelink" | head -1); \
 	if [ -n "$$BUILT" ]; then \
 	  cp "$$BUILT" coordinator.bin; \
@@ -30,7 +30,7 @@ coordinator:
 	fi
 
 sensor-node:
-	$(MAKE) distclean 2>/dev/null; $(MAKE) NODEID=2
+	$(MAKE) distclean 2>/dev/null; $(MAKE) NODEID=2 SUPPORTS_PROP_MODE=0
 	@BUILT=$$(find build -name "node.simplelink" | head -1); \
 	if [ -n "$$BUILT" ]; then \
 	  cp "$$BUILT" sensor-node.bin; \
