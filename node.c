@@ -58,6 +58,8 @@
 #define LOG_MODULE "App"
 #define LOG_LEVEL LOG_LEVEL_INFO
 
+
+
 /* UDP port for communication */
 #define UDP_PORT 8765
 
@@ -140,6 +142,8 @@ PROCESS_THREAD(node_process, ev, data)
    * ------------------------------------------------------------------ */
   if(node_id == 1) {
     LOG_INFO("This device is COORDINATOR (node_id=1).\n");
+    /* Configure TSCH coordinator role early before MAC layer starts */
+    tsch_set_coordinator(1);
     /* Tell TSCH that this device is the coordinator — before MAC starts */
     NETSTACK_ROUTING.root_start();
   } else {
@@ -185,16 +189,26 @@ PROCESS_THREAD(node_process, ev, data)
       seq++;
       snprintf(buf, sizeof(buf), "%s", MSG_PAYLOAD);
 
-      /* Iterate over every route and unicast to each sensor-node */
+      /* Copy all route IP addresses to a local array first.
+       * This avoids an infinite loop caused by list mutations (lookups inside
+       * simple_udp_sendto move route entries to the head of the routelist). */
+      int num_routes = 0;
+      static uip_ipaddr_t dest_ips[UIP_DS6_ROUTE_NB];
       for(route = uip_ds6_route_head();
-          route != NULL;
+          route != NULL && num_routes < UIP_DS6_ROUTE_NB;
           route = uip_ds6_route_next(route)) {
+        uip_ipaddr_copy(&dest_ips[num_routes], &route->ipaddr);
+        num_routes++;
+      }
 
+      /* Iterate over copied array and unicast to each sensor-node */
+      int i;
+      for(i = 0; i < num_routes; i++) {
         LOG_INFO("Sending to node -> ");
-        LOG_INFO_6ADDR(&route->ipaddr);
+        LOG_INFO_6ADDR(&dest_ips[i]);
         LOG_INFO_(" : \"%s\" [%lu]\n", buf, (unsigned long)seq);
 
-        simple_udp_sendto(&udp_conn, buf, strlen(buf), &route->ipaddr);
+        simple_udp_sendto(&udp_conn, buf, strlen(buf), &dest_ips[i]);
       }
     }
   }

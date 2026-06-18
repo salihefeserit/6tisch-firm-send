@@ -100,6 +100,10 @@
 /************* Other system configuration **************/
 /*******************************************************/
 
+/* Increase packet buffer queue size to prevent overflow with multiple sensor
+ * nodes */
+#define QUEUEBUF_CONF_NUM 16
+
 /* Logging */
 #ifndef CONTIKI_TARGET_Z1
 #define LOG_CONF_LEVEL_RPL LOG_LEVEL_WARN
