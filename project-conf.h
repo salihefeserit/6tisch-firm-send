@@ -81,9 +81,6 @@
 /* Do not start TSCH at init, wait for NETSTACK_MAC.on() */
 #define TSCH_CONF_AUTOSTART 0
 
-/* 6TiSCH minimal schedule length. */
-#define TSCH_SCHEDULE_CONF_DEFAULT_LENGTH 3
-
 /* Shorten the EB (Enhanced Beacon) transmission period:
  * More frequent EB → nodes synchronize faster (in seconds). */
 #define TSCH_CONF_EB_PERIOD (2 * CLOCK_SECOND)
@@ -99,10 +96,6 @@
 /*******************************************************/
 /************* Other system configuration **************/
 /*******************************************************/
-
-/* Increase packet buffer queue size to prevent overflow with multiple sensor
- * nodes */
-#define QUEUEBUF_CONF_NUM 16
 
 /* Logging */
 #ifndef CONTIKI_TARGET_Z1

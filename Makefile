@@ -31,9 +31,9 @@ coordinator:
 	@BUILT=$$(find build -name "node.simplelink" | head -1); \
 	if [ -n "$$BUILT" ]; then \
 	  cp "$$BUILT" coordinator.bin; \
-	  echo ">>> Koordinator binary hazir: coordinator.bin"; \
+	  echo ">>> Coordinator binary ready: coordinator.bin"; \
 	else \
-	  echo "HATA: Binary bulunamadi!"; exit 1; \
+	  echo "ERROR: Binary not found!"; exit 1; \
 	fi
 
 sensor-node:
@@ -41,10 +41,10 @@ sensor-node:
 	@BUILT=$$(find build -name "node.simplelink" | head -1); \
 	if [ -n "$$BUILT" ]; then \
 	  cp "$$BUILT" sensor-node.bin; \
-	  echo ">>> Sensor-node binary hazir: sensor-node.bin"; \
-	  echo ">>> (Her cihazda ayni binary kullanilabilir - donanim MAC adresi benzersizdir)"; \
+	  echo ">>> Sensor-node binary ready: sensor-node.bin"; \
+	  echo ">>> (Same binary can be used on each device - hardware MAC address is unique)"; \
 	else \
-	  echo "HATA: Binary bulunamadi!"; exit 1; \
+	  echo "ERROR: Binary not found!"; exit 1; \
 	fi
 
 .PHONY: coordinator sensor-node
