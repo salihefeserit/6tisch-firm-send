@@ -110,4 +110,13 @@
 
 #define TSCH_LOG_CONF_PER_SLOT 1
 
+/* External Flash Configuration */
+#define EXT_FLASH_SPI_CONTROLLER 0
+#define EXT_FLASH_SPI_PIN_SCK 10
+#define EXT_FLASH_SPI_PIN_MOSI 9
+#define EXT_FLASH_SPI_PIN_MISO 8
+#define EXT_FLASH_SPI_PIN_CS 20
+#define EXT_FLASH_DEVICE_ID 0x14
+#define EXT_FLASH_MID 0xC2
+
 #endif /* PROJECT_CONF_H_ */

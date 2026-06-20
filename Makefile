@@ -10,6 +10,7 @@ PLATFORMS_EXCLUDE = sky native z1
 
 # Simple Energest
 MODULES += $(CONTIKI_NG_SERVICES_DIR)/simple-energest
+MODULES += arch/dev/storage/ext-flash
 
 CONTIKI=../../..
 
@@ -114,5 +115,8 @@ endif
 ifeq ($(MAKE_WITH_PERIODIC_ROUTES_PRINT),1)
 CFLAGS += -DWITH_PERIODIC_ROUTES_PRINT=1
 endif
+
+CFLAGS += -DEXT_FLASH_PROGRAM_PAGE_SIZE=256
+CFLAGS += -DEXT_FLASH_ERASE_SECTOR_SIZE=4096
 
 include $(CONTIKI)/Makefile.include
