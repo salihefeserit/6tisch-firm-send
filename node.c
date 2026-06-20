@@ -139,21 +139,9 @@ coordinator_has_routes(void)
 
 /*---------------------------------------------------------------------------*/
 static void send_to_all(fw_packet_t *pkt, uint16_t len) {
-  uip_ds6_route_t *route;
-  int num_routes = 0;
-  static uip_ipaddr_t dest_ips[UIP_DS6_ROUTE_NB];
-  
-  /* Copy all routes to avoid list modification issues during traversal */
-  for(route = uip_ds6_route_head();
-      route != NULL && num_routes < UIP_DS6_ROUTE_NB;
-      route = uip_ds6_route_next(route)) {
-    uip_ipaddr_copy(&dest_ips[num_routes], &route->ipaddr);
-    num_routes++;
-  }
-  
-  for(int i = 0; i < num_routes; i++) {
-    simple_udp_sendto(&udp_conn, pkt, len, &dest_ips[i]);
-  }
+  uip_ipaddr_t dest_ip;
+  uip_create_linklocal_allnodes_mcast(&dest_ip);
+  simple_udp_sendto(&udp_conn, pkt, len, &dest_ip);
 }
 
 /*---------------------------------------------------------------------------*/
