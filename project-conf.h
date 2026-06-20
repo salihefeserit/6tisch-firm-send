@@ -119,4 +119,7 @@
 #define EXT_FLASH_DEVICE_ID 0x14
 #define EXT_FLASH_MID 0xC2
 
+/* Normal low-power shared slot period */
+#define ORCHESTRA_CONF_COMMON_SHARED_PERIOD 61
+
 #endif /* PROJECT_CONF_H_ */

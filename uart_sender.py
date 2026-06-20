@@ -40,8 +40,8 @@ def send_firmware(port, filename):
         print(f"Sent chunk offset 0x{i:05X} len {len(chunk)}")
         
         # Add slight delay to avoid UDP congestion and TSCH queue overflow
-        # 0.25 seconds allows the coordinator to send the packet over TSCH properly
-        time.sleep(0.25)
+        # 0.15 seconds allows the coordinator to send the packet over TSCH properly with shared period 11
+        time.sleep(0.15)
         
     # Send VERIFY
     time.sleep(1)

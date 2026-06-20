@@ -18,6 +18,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "net/mac/tsch/tsch-schedule.h"
+#include "services/orchestra/orchestra.h"
 
 #include "ext-flash.h"
 #include "Board.h"
@@ -50,6 +52,9 @@ AUTOSTART_PROCESSES(&node_process);
 /*---------------------------------------------------------------------------*/
 static struct simple_udp_connection udp_conn;
 
+static void set_shared_period(uint16_t new_size);
+static void reset_ota_timer(void);
+
 /*---------------------------------------------------------------------------*/
 /* Fast hex char to byte converter */
 static uint8_t hex2val(char c) {
@@ -77,6 +82,7 @@ udp_rx_callback(struct simple_udp_connection *c,
   const fw_packet_t *pkt = (const fw_packet_t *)data;
 
   if(pkt->type == PKT_TYPE_START) {
+    set_shared_period(11);
     LOG_INFO("[OTA] START received. File size: %lu\n", (unsigned long)pkt->offset);
     current_file_size = pkt->offset;
     if(ext_flash_open(NULL)) {
@@ -89,6 +95,7 @@ udp_rx_callback(struct simple_udp_connection *c,
     }
   } 
   else if(pkt->type == PKT_TYPE_DATA) {
+    set_shared_period(11); /* Reset timeout timer and ensure fast period */
     LOG_INFO("[OTA] DATA received: offset 0x%05lx, len %u\n", (unsigned long)pkt->offset, pkt->length);
     if(ext_flash_open(NULL)) {
       /* If crossing a sector boundary, erase the new sector */
@@ -126,6 +133,7 @@ udp_rx_callback(struct simple_udp_connection *c,
     } else {
       LOG_INFO("[OTA VERIFY FAILED] Checksum mismatch! Expected 0x%08lx, got 0x%08lx\n", (unsigned long)pkt->offset, (unsigned long)checksum);
     }
+    set_shared_period(61);
   }
 }
 
@@ -135,6 +143,37 @@ coordinator_has_routes(void)
 {
   return tsch_is_associated &&
          (uip_ds6_route_head() != NULL);
+}
+
+static uint8_t shared_period_is_fast = 0;
+static struct etimer ota_timeout_timer;
+#define OTA_TIMEOUT_DURATION (60 * CLOCK_SECOND)
+
+static void set_shared_period(uint16_t new_size) {
+  struct tsch_slotframe *sf = tsch_schedule_slotframe_head();
+  while(sf != NULL) {
+    if(sf->size.val == 61 || sf->size.val == 11) {
+      if(sf->size.val != new_size) {
+        LOG_INFO("[OTA] Changing shared slotframe size from %u to %u\n", sf->size.val, new_size);
+        TSCH_ASN_DIVISOR_INIT(sf->size, new_size);
+      }
+      if(new_size == 11) {
+        shared_period_is_fast = 1;
+        etimer_set(&ota_timeout_timer, OTA_TIMEOUT_DURATION);
+      } else {
+        shared_period_is_fast = 0;
+        etimer_stop(&ota_timeout_timer);
+      }
+      break;
+    }
+    sf = tsch_schedule_slotframe_next(sf);
+  }
+}
+
+static void reset_ota_timer(void) {
+  if(shared_period_is_fast) {
+    etimer_set(&ota_timeout_timer, OTA_TIMEOUT_DURATION);
+  }
 }
 
 /*---------------------------------------------------------------------------*/
@@ -176,75 +215,86 @@ PROCESS_THREAD(node_process, ev, data)
     LOG_INFO("Routes detected. Ready to receive firmware via UART.\n");
     
     while(1) {
-      PROCESS_WAIT_EVENT_UNTIL(ev == serial_line_event_message && data != NULL);
-      char *str = (char *)data;
-      
-      extern struct process serial_shell_process;
-      if(strncmp(str, "FW:", 3) == 0) {
-        uint32_t offset;
-        unsigned int length;
-        static char hexdata[130];
+      PROCESS_WAIT_EVENT();
+      if(ev == serial_line_event_message && data != NULL) {
+        char *str = (char *)data;
         
-        memset(hexdata, 0, sizeof(hexdata));
-        
-        if(str[3] == 'S') {
-          /* Stop the serial shell to prevent 'Command not found' outputs during transmission */
-          if(process_is_running(&serial_shell_process)) {
-            process_exit(&serial_shell_process);
-          }
-          if(sscanf(str, "FW:S:%lx", &offset) == 1) {
-            fw_packet_t pkt;
-            pkt.type = PKT_TYPE_START;
-            pkt.offset = offset;
-            pkt.length = 0;
-            send_to_all(&pkt, 7); /* 7 is offsetof(fw_packet_t, data) */
-            LOG_INFO("Sent START, size: %lu\n", (unsigned long)offset);
-          }
-        }
-        else if(str[3] == 'D') {
-          if(sscanf(str, "FW:D:%lx:%x:%128s", &offset, &length, hexdata) >= 3) {
-            fw_packet_t pkt;
-            pkt.type = PKT_TYPE_DATA;
-            pkt.offset = offset;
-            pkt.length = length;
-            
-            for(int i = 0; i < length; i++) {
-              pkt.data[i] = (hex2val(hexdata[i*2]) << 4) | hex2val(hexdata[i*2+1]);
+        extern struct process serial_shell_process;
+        if(strncmp(str, "FW:", 3) == 0) {
+          uint32_t offset;
+          unsigned int length;
+          static char hexdata[130];
+          
+          memset(hexdata, 0, sizeof(hexdata));
+          
+          if(str[3] == 'S') {
+            /* Stop the serial shell to prevent 'Command not found' outputs during transmission */
+            if(process_is_running(&serial_shell_process)) {
+              process_exit(&serial_shell_process);
             }
-            
-            send_to_all(&pkt, 7 + length);
-            LOG_INFO("Sent DATA offset 0x%05lx len %u\n", (unsigned long)offset, length);
-          }
-        }
-        else if(str[3] == 'V') {
-          if(sscanf(str, "FW:V:%lx", &offset) == 1) {
-            fw_packet_t pkt;
-            pkt.type = PKT_TYPE_VERIFY;
-            pkt.offset = offset;
-            pkt.length = 0;
-            send_to_all(&pkt, 7);
-            LOG_INFO("Sent VERIFY, expected checksum: 0x%08lx\n", (unsigned long)offset);
-            
-            /* Restart the serial shell now that transmission is complete */
-            if(!process_is_running(&serial_shell_process)) {
-              process_start(&serial_shell_process, NULL);
+            if(sscanf(str, "FW:S:%lx", &offset) == 1) {
+              fw_packet_t pkt;
+              pkt.type = PKT_TYPE_START;
+              pkt.offset = offset;
+              pkt.length = 0;
+              send_to_all(&pkt, 7); /* 7 is offsetof(fw_packet_t, data) */
+              LOG_INFO("Sent START, size: %lu\n", (unsigned long)offset);
             }
           }
+          else if(str[3] == 'D') {
+            if(sscanf(str, "FW:D:%lx:%x:%128s", &offset, &length, hexdata) >= 3) {
+              set_shared_period(11); /* Switch to fast period on data transmission */
+              fw_packet_t pkt;
+              pkt.type = PKT_TYPE_DATA;
+              pkt.offset = offset;
+              pkt.length = length;
+              
+              for(int i = 0; i < length; i++) {
+                pkt.data[i] = (hex2val(hexdata[i*2]) << 4) | hex2val(hexdata[i*2+1]);
+              }
+              
+              send_to_all(&pkt, 7 + length);
+              LOG_INFO("Sent DATA offset 0x%05lx len %u\n", (unsigned long)offset, length);
+            }
+          }
+          else if(str[3] == 'V') {
+            if(sscanf(str, "FW:V:%lx", &offset) == 1) {
+              fw_packet_t pkt;
+              pkt.type = PKT_TYPE_VERIFY;
+              pkt.offset = offset;
+              pkt.length = 0;
+              send_to_all(&pkt, 7);
+              LOG_INFO("Sent VERIFY, expected checksum: 0x%08lx\n", (unsigned long)offset);
+              reset_ota_timer(); /* Let the timeout timer return us to normal 61 period */
+              
+              /* Restart the serial shell now that transmission is complete */
+              if(!process_is_running(&serial_shell_process)) {
+                process_start(&serial_shell_process, NULL);
+              }
+            }
+          }
+        } else {
+          /* If it's a regular shell command and the shell was stopped (e.g. from an aborted update), restart it */
+          if(!process_is_running(&serial_shell_process)) {
+            process_start(&serial_shell_process, NULL);
+            /* Post the event back to the shell so it processes the current command */
+            process_post(&serial_shell_process, serial_line_event_message, data);
+          }
         }
-      } else {
-        /* If it's a regular shell command and the shell was stopped (e.g. from an aborted update), restart it */
-        if(!process_is_running(&serial_shell_process)) {
-          process_start(&serial_shell_process, NULL);
-          /* Post the event back to the shell so it processes the current command */
-          process_post(&serial_shell_process, serial_line_event_message, data);
-        }
+      } else if(ev == PROCESS_EVENT_TIMER && data == &ota_timeout_timer) {
+        LOG_INFO("[OTA] Timeout reached on coordinator, dropping back to low-power\n");
+        set_shared_period(61);
       }
     }
   }
 
-  /* Sensor-node: just keep the process alive — udp_rx_callback does the work */
+  /* Sensor-node: keep the process alive and handle timeout */
   while(1) {
     PROCESS_WAIT_EVENT();
+    if(ev == PROCESS_EVENT_TIMER && data == &ota_timeout_timer) {
+      LOG_INFO("[OTA] Timeout reached on sensor-node, dropping back to low-power\n");
+      set_shared_period(61);
+    }
   }
 
   PROCESS_END();
