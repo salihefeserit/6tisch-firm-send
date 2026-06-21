@@ -2,3 +2,4 @@
 build/
 coordinator.bin
 sensor-node.bin
+coordinator.log

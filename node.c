@@ -45,8 +45,16 @@ typedef struct __attribute__((packed)) {
 /* Global variables for flash tracking */
 static uint32_t current_file_size = 0;
 
+#define PAGE_SIZE 4096
+static uint8_t page_buffer[PAGE_SIZE];
+static uint32_t page_start_offset = 0;
+static uint16_t page_bytes_received = 0;
+static uint16_t expected_page_size = 0;
+static uint8_t distribution_in_progress = 0;
+
 /*---------------------------------------------------------------------------*/
 PROCESS(node_process, "6TiSCH Node");
+PROCESS(distribute_process, "OTA Distribution Process");
 AUTOSTART_PROCESSES(&node_process);
 
 /*---------------------------------------------------------------------------*/
@@ -184,6 +192,58 @@ static void send_to_all(fw_packet_t *pkt, uint16_t len) {
 }
 
 /*---------------------------------------------------------------------------*/
+PROCESS_THREAD(distribute_process, ev, data)
+{
+  static struct etimer dist_timer;
+  static uint16_t dist_chunk_idx;
+  static uint16_t total_chunks;
+
+  PROCESS_BEGIN();
+
+  total_chunks = (expected_page_size + 63) / 64;
+  LOG_INFO("Distributing page at offset 0x%05lx, total chunks: %u\n", (unsigned long)page_start_offset, total_chunks);
+
+  for(dist_chunk_idx = 0; dist_chunk_idx < total_chunks; dist_chunk_idx++) {
+    uint32_t chunk_abs_offset = page_start_offset + dist_chunk_idx * 64;
+    uint16_t chunk_len = 64;
+    if(chunk_abs_offset + chunk_len > page_start_offset + expected_page_size) {
+      chunk_len = (page_start_offset + expected_page_size) - chunk_abs_offset;
+    }
+
+    fw_packet_t pkt;
+    pkt.type = PKT_TYPE_DATA;
+    pkt.offset = chunk_abs_offset;
+    pkt.length = chunk_len;
+    memcpy(pkt.data, &page_buffer[dist_chunk_idx * 64], chunk_len);
+
+    send_to_all(&pkt, 7 + chunk_len);
+    LOG_INFO("Distributed chunk %u/%u: offset 0x%05lx, len %u\n", 
+             dist_chunk_idx + 1, total_chunks, (unsigned long)chunk_abs_offset, chunk_len);
+
+    /* Wait for 150 ms to avoid network congestion and queue overflows */
+    etimer_set(&dist_timer, CLOCK_SECOND * 15 / 100);
+    PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
+  }
+
+  LOG_INFO("Page distribution complete for offset 0x%05lx\n", (unsigned long)page_start_offset);
+
+  /* Advance to next page */
+  page_start_offset += expected_page_size;
+  page_bytes_received = 0;
+  if(page_start_offset < current_file_size) {
+    expected_page_size = (current_file_size - page_start_offset > PAGE_SIZE) ? PAGE_SIZE : (current_file_size - page_start_offset);
+  } else {
+    expected_page_size = 0;
+  }
+  distribution_in_progress = 0;
+
+  /* Print FW:PAGE_OK to serial line to notify python script */
+  printf("FW:PAGE_OK\n");
+
+  PROCESS_END();
+}
+
+/*---------------------------------------------------------------------------*/
 PROCESS_THREAD(node_process, ev, data)
 {
   PROCESS_BEGIN();
@@ -239,22 +299,48 @@ PROCESS_THREAD(node_process, ev, data)
               pkt.length = 0;
               send_to_all(&pkt, 7); /* 7 is offsetof(fw_packet_t, data) */
               LOG_INFO("Sent START, size: %lu\n", (unsigned long)offset);
+
+              /* Initialize page variables */
+              current_file_size = offset;
+              page_start_offset = 0;
+              page_bytes_received = 0;
+              expected_page_size = (current_file_size > PAGE_SIZE) ? PAGE_SIZE : current_file_size;
+              distribution_in_progress = 0;
+              
+              /* Acknowledge START command */
+              printf("FW:ACK\n");
             }
           }
           else if(str[3] == 'D') {
             if(sscanf(str, "FW:D:%lx:%x:%128s", &offset, &length, hexdata) >= 3) {
               set_shared_period(11); /* Switch to fast period on data transmission */
-              fw_packet_t pkt;
-              pkt.type = PKT_TYPE_DATA;
-              pkt.offset = offset;
-              pkt.length = length;
               
-              for(int i = 0; i < length; i++) {
-                pkt.data[i] = (hex2val(hexdata[i*2]) << 4) | hex2val(hexdata[i*2+1]);
+              if(distribution_in_progress) {
+                LOG_INFO("[ERROR] Page distribution in progress, ignoring UART chunk!\n");
+              } else if(offset >= page_start_offset && offset < page_start_offset + expected_page_size) {
+                uint32_t rel_offset = offset - page_start_offset;
+                if(rel_offset + length <= expected_page_size) {
+                  for(int i = 0; i < length; i++) {
+                    page_buffer[rel_offset + i] = (hex2val(hexdata[i*2]) << 4) | hex2val(hexdata[i*2+1]);
+                  }
+                  page_bytes_received += length;
+                  LOG_INFO("Buffered chunk offset 0x%05lx, len %u. Progress: %u/%u\n",
+                           (unsigned long)offset, length, page_bytes_received, expected_page_size);
+
+                  /* Acknowledge successful buffering of this chunk */
+                  printf("FW:ACK\n");
+
+                  if(page_bytes_received == expected_page_size) {
+                    distribution_in_progress = 1;
+                    process_start(&distribute_process, NULL);
+                  }
+                } else {
+                  LOG_INFO("[ERROR] Chunk write exceeds page boundary!\n");
+                }
+              } else {
+                LOG_INFO("[ERROR] Chunk offset 0x%05lx out of bounds for page starting at 0x%05lx\n",
+                         (unsigned long)offset, (unsigned long)page_start_offset);
               }
-              
-              send_to_all(&pkt, 7 + length);
-              LOG_INFO("Sent DATA offset 0x%05lx len %u\n", (unsigned long)offset, length);
             }
           }
           else if(str[3] == 'V') {
@@ -265,6 +351,10 @@ PROCESS_THREAD(node_process, ev, data)
               pkt.length = 0;
               send_to_all(&pkt, 7);
               LOG_INFO("Sent VERIFY, expected checksum: 0x%08lx\n", (unsigned long)offset);
+              
+              /* Acknowledge VERIFY command */
+              printf("FW:ACK\n");
+
               reset_ota_timer(); /* Let the timeout timer return us to normal 61 period */
               
               /* Restart the serial shell now that transmission is complete */
