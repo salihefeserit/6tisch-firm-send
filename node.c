@@ -72,6 +72,20 @@ static uint8_t hex2val(char c) {
   return 0;
 }
 
+/* Page chunk delivery tracking bitmap */
+static uint32_t current_rx_page_offset = 0xFFFFFFFF;
+static uint8_t page_bitmap[8];
+
+static void print_page_bitmap(void) {
+  if(current_rx_page_offset != 0xFFFFFFFF) {
+    LOG_INFO("[OTA] Page 0x%05lx Rx complete. Bitmap: ", (unsigned long)current_rx_page_offset);
+    for(int i = 0; i < sizeof(page_bitmap); i++) {
+      printf("%02x", page_bitmap[i]);
+    }
+    printf("\n");
+  }
+}
+
 /*---------------------------------------------------------------------------*/
 /* UDP receive callback for Sensor Node */
 static void
@@ -93,6 +107,11 @@ udp_rx_callback(struct simple_udp_connection *c,
     set_shared_period(11);
     LOG_INFO("[OTA] START received. File size: %lu\n", (unsigned long)pkt->offset);
     current_file_size = pkt->offset;
+    
+    /* Reset bitmap variables */
+    current_rx_page_offset = 0xFFFFFFFF;
+    memset(page_bitmap, 0, sizeof(page_bitmap));
+    
     if(ext_flash_open(NULL)) {
       /* Erase the first sector */
       LOG_INFO("Erasing initial sector at 0x00000...\n");
@@ -105,6 +124,25 @@ udp_rx_callback(struct simple_udp_connection *c,
   else if(pkt->type == PKT_TYPE_DATA) {
     set_shared_period(11); /* Reset timeout timer and ensure fast period */
     LOG_INFO("[OTA] DATA received: offset 0x%05lx, len %u\n", (unsigned long)pkt->offset, pkt->length);
+    
+    uint32_t page_offset = pkt->offset - (pkt->offset % EXT_FLASH_ERASE_SECTOR_SIZE);
+    if(current_rx_page_offset == 0xFFFFFFFF) {
+      current_rx_page_offset = page_offset;
+      memset(page_bitmap, 0, sizeof(page_bitmap));
+    } else if(page_offset != current_rx_page_offset) {
+      /* Page boundary crossed, print previous page bitmap */
+      print_page_bitmap();
+      current_rx_page_offset = page_offset;
+      memset(page_bitmap, 0, sizeof(page_bitmap));
+    }
+
+    if(pkt->length > 0) {
+      uint16_t chunk_idx = (pkt->offset % EXT_FLASH_ERASE_SECTOR_SIZE) / pkt->length;
+      if(chunk_idx < 64) {
+        page_bitmap[chunk_idx / 8] |= (1 << (chunk_idx % 8));
+      }
+    }
+
     if(ext_flash_open(NULL)) {
       /* If crossing a sector boundary, erase the new sector */
       if(pkt->offset > 0 && (pkt->offset % EXT_FLASH_ERASE_SECTOR_SIZE) == 0) {
@@ -123,6 +161,11 @@ udp_rx_callback(struct simple_udp_connection *c,
   }
   else if(pkt->type == PKT_TYPE_VERIFY) {
     LOG_INFO("[OTA] VERIFY request received! Expected CRC: 0x%08lx\n", (unsigned long)pkt->offset);
+    
+    /* Print final page bitmap */
+    print_page_bitmap();
+    current_rx_page_offset = 0xFFFFFFFF;
+    
     uint32_t checksum = 0;
     if(ext_flash_open(NULL)) {
        uint8_t buf[64];
