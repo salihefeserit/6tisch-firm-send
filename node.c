@@ -17,6 +17,8 @@
 #include "services/simple-energest/simple-energest.h"
 #include "sys/log.h"
 #include "sys/node-id.h"
+#include "sys/ctimer.h"
+#include "lib/random.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,6 +100,22 @@ static uint8_t last_page_bitmap[8];
 /* Event to signal distribute_process when a bitmap report is received */
 static process_event_t event_bitmap_received;
 
+#define MAX_NODES 16
+static uip_ipaddr_t session_nodes[MAX_NODES];
+static uint8_t session_nodes_count = 0;
+static uint8_t node_replied[MAX_NODES];
+static uint8_t retry_count = 0;
+
+static struct ctimer report_ctimer;
+static bitmap_report_t report_to_send;
+
+static void send_report_callback(void *ptr) {
+  if (node_id != 1 && has_coordinator_ip) {
+    LOG_INFO("[OTA] Sending delayed bitmap report...\n");
+    simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &coordinator_ip);
+  }
+}
+
 static void print_page_bitmap(void) {
   if (current_rx_page_offset != 0xFFFFFFFF) {
     LOG_INFO("[OTA] Page 0x%05lx Rx complete. Bitmap: ",
@@ -109,11 +127,13 @@ static void print_page_bitmap(void) {
 
     /* Send report to coordinator if IP is known and we are a sensor node */
     if (node_id != 1 && has_coordinator_ip) {
-      bitmap_report_t report;
-      report.type = PKT_TYPE_BITMAP_REPORT;
-      report.page_offset = current_rx_page_offset;
-      memcpy(report.bitmap, page_bitmap, sizeof(page_bitmap));
-      simple_udp_sendto(&udp_conn, &report, sizeof(report), &coordinator_ip);
+      report_to_send.type = PKT_TYPE_BITMAP_REPORT;
+      report_to_send.page_offset = current_rx_page_offset;
+      memcpy(report_to_send.bitmap, page_bitmap, sizeof(page_bitmap));
+      
+      clock_time_t delay = (random_rand() % 1500) * CLOCK_SECOND / 1000;
+      LOG_INFO("[OTA] Scheduling bitmap report send in %lu ms\n", (unsigned long)(delay * 1000 / CLOCK_SECOND));
+      ctimer_set(&report_ctimer, delay, send_report_callback, NULL);
     }
   }
 }
@@ -139,7 +159,38 @@ static void udp_rx_callback(struct simple_udp_connection *c,
         printf("\n");
 
         if (report->page_offset == page_start_offset) {
-          process_post(&distribute_process, event_bitmap_received, NULL);
+          int found = -1;
+          for (int i = 0; i < session_nodes_count; i++) {
+            if (memcmp(&session_nodes[i].u8[8], &sender_addr->u8[8], 8) == 0) {
+              found = i;
+              break;
+            }
+          }
+          if (found != -1) {
+            node_replied[found] = 1;
+            LOG_INFO("Marked node ");
+            LOG_INFO_6ADDR(sender_addr);
+            LOG_INFO_(" as replied.\n");
+            
+            /* Check if all session nodes have replied */
+            uint8_t all_replied = 1;
+            for (int i = 0; i < session_nodes_count; i++) {
+              if (!node_replied[i]) {
+                all_replied = 0;
+                break;
+              }
+            }
+            if (all_replied) {
+              LOG_INFO("All expected nodes replied. Notifying distribution process.\n");
+              process_post(&distribute_process, event_bitmap_received, NULL);
+            } else {
+              LOG_INFO("Still waiting for other nodes to reply.\n");
+            }
+          } else {
+            LOG_WARN("Received bitmap report from unexpected/dropped node: ");
+            LOG_WARN_6ADDR(sender_addr);
+            LOG_WARN_("\n");
+          }
         }
       }
     }
@@ -244,11 +295,13 @@ static void udp_rx_callback(struct simple_udp_connection *c,
       /* Retransmission request from coordinator. Send the last backup report */
       LOG_INFO("[OTA] Retransmitting bitmap report for page 0x%05lx\n", (unsigned long)last_rx_page_offset);
       if (has_coordinator_ip) {
-        bitmap_report_t report;
-        report.type = PKT_TYPE_BITMAP_REPORT;
-        report.page_offset = last_rx_page_offset;
-        memcpy(report.bitmap, last_page_bitmap, sizeof(last_page_bitmap));
-        simple_udp_sendto(&udp_conn, &report, sizeof(report), &coordinator_ip);
+        report_to_send.type = PKT_TYPE_BITMAP_REPORT;
+        report_to_send.page_offset = last_rx_page_offset;
+        memcpy(report_to_send.bitmap, last_page_bitmap, sizeof(last_page_bitmap));
+        
+        clock_time_t delay = (random_rand() % 1500) * CLOCK_SECOND / 1000;
+        LOG_INFO("[OTA] Scheduling backup report retransmit in %lu ms\n", (unsigned long)(delay * 1000 / CLOCK_SECOND));
+        ctimer_set(&report_ctimer, delay, send_report_callback, NULL);
       }
     }
   } else if (pkt->type == PKT_TYPE_VERIFY) {
@@ -369,25 +422,85 @@ PROCESS_THREAD(distribute_process, ev, data) {
   LOG_INFO("Page distribution complete for offset 0x%05lx\n",
            (unsigned long)page_start_offset);
 
-  /* Broadcast PAGE_END packet */
-  end_pkt.type = PKT_TYPE_PAGE_END;
-  end_pkt.offset = page_start_offset;
-  end_pkt.length = 0;
-  send_to_all(&end_pkt, 7);
-  LOG_INFO("Sent PAGE_END for offset 0x%05lx, waiting for bitmap...\n", (unsigned long)page_start_offset);
+  /* Reset reply tracking for all session nodes */
+  memset(node_replied, 0, sizeof(node_replied));
+  retry_count = 0;
 
-  /* Wait for bitmap report (or timeout of 5.0 seconds) */
-  etimer_set(&dist_timer, CLOCK_SECOND * 5);
-  while (1) {
-    PROCESS_WAIT_EVENT();
-    if (ev == PROCESS_EVENT_TIMER && data == &dist_timer) {
-      LOG_INFO("Timeout waiting for bitmap, sending PAGE_END again...\n");
-      send_to_all(&end_pkt, 7);
-      etimer_set(&dist_timer, CLOCK_SECOND * 5);
-    } else if (ev == event_bitmap_received) {
-      LOG_INFO("Bitmap received! Proceeding to next page.\n");
-      break;
+  if (session_nodes_count > 0) {
+    LOG_INFO("Expecting reports from %u nodes for page 0x%05lx:\n", session_nodes_count, (unsigned long)page_start_offset);
+    for(int i = 0; i < session_nodes_count; i++) {
+      LOG_INFO("  - ");
+      LOG_INFO_6ADDR(&session_nodes[i]);
+      LOG_INFO_("\n");
     }
+
+    /* Broadcast PAGE_END packet */
+    end_pkt.type = PKT_TYPE_PAGE_END;
+    end_pkt.offset = page_start_offset;
+    end_pkt.length = 0;
+    send_to_all(&end_pkt, 7);
+    LOG_INFO("Sent PAGE_END for offset 0x%05lx, waiting for bitmap...\n", (unsigned long)page_start_offset);
+
+    /* Wait for bitmap report (or timeout of 5.0 seconds) */
+    etimer_set(&dist_timer, CLOCK_SECOND * 5);
+    while (1) {
+      PROCESS_WAIT_EVENT();
+      if (ev == PROCESS_EVENT_TIMER && data == &dist_timer) {
+        retry_count++;
+        
+        /* Print pending nodes */
+        LOG_INFO("Timeout (%d/5) waiting for reports. Pending nodes:\n", retry_count);
+        for(int i = 0; i < session_nodes_count; i++) {
+          if(!node_replied[i]) {
+            LOG_INFO("  - ");
+            LOG_INFO_6ADDR(&session_nodes[i]);
+            LOG_INFO_("\n");
+          }
+        }
+
+        if (retry_count >= 5) {
+          /* Check if at least one node replied */
+          uint8_t replied_count = 0;
+          for(int i = 0; i < session_nodes_count; i++) {
+            if(node_replied[i]) {
+              replied_count++;
+            }
+          }
+
+          if(replied_count > 0) {
+            LOG_INFO("Max retries reached. Dropping unresponsive nodes:\n");
+            /* Drop unresponsive nodes by compacting session_nodes array */
+            int write_idx = 0;
+            for(int i = 0; i < session_nodes_count; i++) {
+              if(node_replied[i]) {
+                if(write_idx != i) {
+                  uip_ipaddr_copy(&session_nodes[write_idx], &session_nodes[i]);
+                }
+                write_idx++;
+              } else {
+                LOG_INFO("  - Dropped: ");
+                LOG_INFO_6ADDR(&session_nodes[i]);
+                LOG_INFO_("\n");
+              }
+            }
+            session_nodes_count = write_idx;
+            break; /* Proceed to next page */
+          } else {
+            LOG_WARN("Max retries reached but 0 nodes replied. Resetting retry count and continuing to wait...\n");
+            retry_count = 0;
+          }
+        }
+        
+        LOG_INFO("Sending PAGE_END again...\n");
+        send_to_all(&end_pkt, 7);
+        etimer_set(&dist_timer, CLOCK_SECOND * 5);
+      } else if (ev == event_bitmap_received) {
+        LOG_INFO("Bitmap received from all nodes! Proceeding to next page.\n");
+        break;
+      }
+    }
+  } else {
+    LOG_INFO("No active nodes tracked in this session. Skipping wait for bitmap reports.\n");
   }
 
   /* Advance to next page */
@@ -469,6 +582,29 @@ PROCESS_THREAD(node_process, ev, data) {
               pkt.length = 0;
               send_to_all(&pkt, 7); /* 7 is offsetof(fw_packet_t, data) */
               LOG_INFO("Sent START, size: %lu\n", (unsigned long)offset);
+
+              /* Populate session nodes from RPL routing table */
+              session_nodes_count = 0;
+              uip_ds6_route_t *route;
+              for(route = uip_ds6_route_head(); route != NULL; route = uip_ds6_route_next(route)) {
+                if(session_nodes_count < MAX_NODES) {
+                  uip_ipaddr_copy(&session_nodes[session_nodes_count], &route->ipaddr);
+                  session_nodes_count++;
+                } else {
+                  LOG_WARN("Too many routing entries! Truncating to MAX_NODES (%d)\n", MAX_NODES);
+                  break;
+                }
+              }
+              if(session_nodes_count == 0) {
+                LOG_WARN("No active routes at session start!\n");
+              } else {
+                LOG_INFO("Session started with %u active nodes:\n", session_nodes_count);
+                for(int i = 0; i < session_nodes_count; i++) {
+                  LOG_INFO("  - ");
+                  LOG_INFO_6ADDR(&session_nodes[i]);
+                  LOG_INFO_("\n");
+                }
+              }
 
               /* Initialize page variables */
               current_file_size = offset;
