@@ -55,6 +55,7 @@ extern uint8_t shared_period_is_fast;
 extern uip_ipaddr_t session_nodes[MAX_NODES];
 extern uint8_t session_nodes_count;
 extern uint8_t node_replied[MAX_NODES];
+extern uint8_t session_bitmaps[MAX_NODES][8];
 
 #define OTA_TIMEOUT_DURATION (60 * CLOCK_SECOND)
 

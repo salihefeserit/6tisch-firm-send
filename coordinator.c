@@ -8,6 +8,7 @@
 uip_ipaddr_t session_nodes[MAX_NODES];
 uint8_t session_nodes_count = 0;
 uint8_t node_replied[MAX_NODES];
+uint8_t session_bitmaps[MAX_NODES][8];
 uint8_t retry_count = 0;
 
 process_event_t event_bitmap_received;
@@ -18,18 +19,39 @@ int ota_coordinator_has_routes(void) {
   return tsch_is_associated && (uip_ds6_route_head() != NULL);
 }
 
+/* Check if all active session nodes have received all chunks of the current page */
+static uint8_t page_is_complete(uint16_t total_chunks) {
+  if (session_nodes_count == 0) {
+    return 1;
+  }
+  for (int i = 0; i < session_nodes_count; i++) {
+    for (int chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
+      uint8_t byte_idx = chunk_idx / 8;
+      uint8_t bit_idx = chunk_idx % 8;
+      if ((session_bitmaps[i][byte_idx] & (1 << bit_idx)) == 0) {
+        return 0; /* A node is missing this chunk */
+      }
+    }
+  }
+  return 1;
+}
+
 /* Process thread for distributing a page to all nodes */
 PROCESS_THREAD(distribute_process, ev, data) {
   static struct etimer dist_timer;
   static uint16_t dist_chunk_idx;
   static uint16_t total_chunks;
   static fw_packet_t end_pkt;
+  static uint8_t recovery_round;
 
   PROCESS_BEGIN();
 
   total_chunks = (expected_page_size + 63) / 64;
   LOG_INFO("Distributing page at offset 0x%05lx, total chunks: %u\n",
            (unsigned long)page_start_offset, total_chunks);
+
+  /* Reset session bitmaps to 0 for the new page */
+  memset(session_bitmaps, 0, sizeof(session_bitmaps));
 
   for (dist_chunk_idx = 0; dist_chunk_idx < total_chunks; dist_chunk_idx++) {
     uint32_t chunk_abs_offset = page_start_offset + dist_chunk_idx * 64;
@@ -49,34 +71,57 @@ PROCESS_THREAD(distribute_process, ev, data) {
              dist_chunk_idx + 1, total_chunks, (unsigned long)chunk_abs_offset,
              chunk_len);
 
-    /* Wait for 250 ms to avoid network congestion and queue overflows */
-    etimer_set(&dist_timer, CLOCK_SECOND * 25 / 100);
+    /* Wait for 500 ms to avoid network congestion and queue overflows */
+    etimer_set(&dist_timer, CLOCK_SECOND * 50 / 100);
     PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
   }
 
   LOG_INFO("Page distribution complete for offset 0x%05lx\n",
            (unsigned long)page_start_offset);
 
-  /* Reset reply tracking for all session nodes */
-  memset(node_replied, 0, sizeof(node_replied));
-  retry_count = 0;
+  recovery_round = 0;
 
-  if (session_nodes_count > 0) {
-    LOG_INFO("Expecting reports from %u nodes for page 0x%05lx:\n", session_nodes_count, (unsigned long)page_start_offset);
-    for(int i = 0; i < session_nodes_count; i++) {
+  /* Loop until all active nodes report 100% completion of the page */
+  while (1) {
+    if (session_nodes_count == 0) {
+      LOG_INFO("No active nodes tracked in this session. Skipping wait for bitmap reports.\n");
+      break;
+    }
+
+    /* Check if the page is complete on all nodes before doing a recovery round */
+    if (page_is_complete(total_chunks)) {
+      LOG_INFO("Page 0x%05lx successfully completed on all active nodes!\n",
+               (unsigned long)page_start_offset);
+      break;
+    }
+
+    if (recovery_round >= 10) {
+      LOG_WARN("Max page recovery rounds (10) reached! Moving to next page anyway.\n");
+      break;
+    }
+    recovery_round++;
+
+    LOG_INFO("Expecting reports from %u nodes (Recovery Round %u):\n",
+             session_nodes_count, recovery_round);
+    for (int i = 0; i < session_nodes_count; i++) {
       LOG_INFO("  - ");
       LOG_INFO_6ADDR(&session_nodes[i]);
       LOG_INFO_("\n");
     }
 
-    /* Broadcast PAGE_END packet */
+    /* Reset reply tracking for this round */
+    memset(node_replied, 0, sizeof(node_replied));
+    retry_count = 0;
+
+    /* Broadcast PAGE_END packet to prompt reports */
     end_pkt.type = PKT_TYPE_PAGE_END;
     end_pkt.offset = page_start_offset;
     end_pkt.length = 0;
     send_to_all(&end_pkt, 7);
-    LOG_INFO("Sent PAGE_END for offset 0x%05lx, waiting for bitmap...\n", (unsigned long)page_start_offset);
+    LOG_INFO("Sent PAGE_END for offset 0x%05lx, waiting for bitmap...\n",
+             (unsigned long)page_start_offset);
 
-    /* Wait for bitmap report (or timeout of 5.0 seconds) */
+    /* Wait for bitmap reports (or timeout of 5.0 seconds) */
     etimer_set(&dist_timer, CLOCK_SECOND * 5);
     while (1) {
       PROCESS_WAIT_EVENT();
@@ -85,8 +130,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
         
         /* Print pending nodes */
         LOG_INFO("Timeout (%d/5) waiting for reports. Pending nodes:\n", retry_count);
-        for(int i = 0; i < session_nodes_count; i++) {
-          if(!node_replied[i]) {
+        for (int i = 0; i < session_nodes_count; i++) {
+          if (!node_replied[i]) {
             LOG_INFO("  - ");
             LOG_INFO_6ADDR(&session_nodes[i]);
             LOG_INFO_("\n");
@@ -94,22 +139,23 @@ PROCESS_THREAD(distribute_process, ev, data) {
         }
 
         if (retry_count >= 5) {
-          /* Check if at least one node replied */
+          /* Check if at least one node replied in this round */
           uint8_t replied_count = 0;
-          for(int i = 0; i < session_nodes_count; i++) {
-            if(node_replied[i]) {
+          for (int i = 0; i < session_nodes_count; i++) {
+            if (node_replied[i]) {
               replied_count++;
             }
           }
 
-          if(replied_count > 0) {
+          if (replied_count > 0) {
             LOG_INFO("Max retries reached. Dropping unresponsive nodes:\n");
             /* Drop unresponsive nodes by compacting session_nodes array */
             int write_idx = 0;
-            for(int i = 0; i < session_nodes_count; i++) {
-              if(node_replied[i]) {
-                if(write_idx != i) {
+            for (int i = 0; i < session_nodes_count; i++) {
+              if (node_replied[i]) {
+                if (write_idx != i) {
                   uip_ipaddr_copy(&session_nodes[write_idx], &session_nodes[i]);
+                  memcpy(session_bitmaps[write_idx], session_bitmaps[i], 8);
                 }
                 write_idx++;
               } else {
@@ -119,9 +165,9 @@ PROCESS_THREAD(distribute_process, ev, data) {
               }
             }
             session_nodes_count = write_idx;
-            break; /* Proceed to next page */
+            break; /* Break the wait loop to evaluate completeness and trigger retries */
           } else {
-            LOG_WARN("Max retries reached but 0 nodes replied. Resetting retry count and continuing to wait...\n");
+            LOG_WARN("Max retries reached but 0 nodes replied in this round. Resetting retry count and continuing to wait...\n");
             retry_count = 0;
           }
         }
@@ -130,12 +176,87 @@ PROCESS_THREAD(distribute_process, ev, data) {
         send_to_all(&end_pkt, 7);
         etimer_set(&dist_timer, CLOCK_SECOND * 5);
       } else if (ev == event_bitmap_received) {
-        LOG_INFO("Bitmap received from all nodes! Proceeding to next page.\n");
-        break;
+        /* Double check if all nodes have actually replied in this round to ignore stale events */
+        uint8_t all_replied = 1;
+        for (int i = 0; i < session_nodes_count; i++) {
+          if (!node_replied[i]) {
+            all_replied = 0;
+            break;
+          }
+        }
+        if (all_replied) {
+          LOG_INFO("Bitmap reports received from all active nodes!\n");
+          break;
+        } else {
+          LOG_INFO("Ignored stale event_bitmap_received event.\n");
+        }
       }
     }
-  } else {
-    LOG_INFO("No active nodes tracked in this session. Skipping wait for bitmap reports.\n");
+
+    /* Check completeness again after wait loop exits */
+    if (page_is_complete(total_chunks)) {
+      LOG_INFO("Page 0x%05lx successfully completed on all active nodes!\n",
+               (unsigned long)page_start_offset);
+      break;
+    }
+
+    /* We have missing chunks! Iterate over chunks and count misses to decide unicast vs broadcast */
+    LOG_INFO("Analyzing missing chunks for page 0x%05lx...\n", (unsigned long)page_start_offset);
+    for (dist_chunk_idx = 0; dist_chunk_idx < total_chunks; dist_chunk_idx++) {
+      uint8_t byte_idx = dist_chunk_idx / 8;
+      uint8_t bit_idx = dist_chunk_idx % 8;
+      uint8_t missed_count = 0;
+      int last_missed_node_idx = -1;
+
+      for (int i = 0; i < session_nodes_count; i++) {
+        if ((session_bitmaps[i][byte_idx] & (1 << bit_idx)) == 0) {
+          missed_count++;
+          last_missed_node_idx = i;
+        }
+      }
+
+      if (missed_count > 0) {
+        uint32_t chunk_abs_offset = page_start_offset + dist_chunk_idx * 64;
+        uint16_t chunk_len = 64;
+        if (chunk_abs_offset + chunk_len > page_start_offset + expected_page_size) {
+          chunk_len = (page_start_offset + expected_page_size) - chunk_abs_offset;
+        }
+
+        fw_packet_t pkt;
+        pkt.type = PKT_TYPE_DATA;
+        pkt.offset = chunk_abs_offset;
+        pkt.length = chunk_len;
+        memcpy(pkt.data, &page_buffer[dist_chunk_idx * 64], chunk_len);
+
+        if (missed_count == 1) {
+          /* Exactly 1 node missed this chunk: Check if it is a 1-hop neighbor */
+          uip_ds6_route_t *r = uip_ds6_route_lookup(&session_nodes[last_missed_node_idx]);
+          const uip_ipaddr_t *nexthop = (r != NULL) ? uip_ds6_route_nexthop(r) : NULL;
+          uint8_t is_one_hop = (r != NULL && nexthop != NULL && uip_ipaddr_cmp(nexthop, &session_nodes[last_missed_node_idx]));
+
+          if (is_one_hop) {
+            LOG_INFO("Retransmitting chunk %u unicast to ", dist_chunk_idx);
+            LOG_INFO_6ADDR(&session_nodes[last_missed_node_idx]);
+            LOG_INFO_(" (offset 0x%05lx)\n", (unsigned long)chunk_abs_offset);
+            simple_udp_sendto(&udp_conn, &pkt, 7 + chunk_len, &session_nodes[last_missed_node_idx]);
+          } else {
+            LOG_INFO("Retransmitting chunk %u broadcast (multi-hop target: ", dist_chunk_idx);
+            LOG_INFO_6ADDR(&session_nodes[last_missed_node_idx]);
+            LOG_INFO_(", offset 0x%05lx)\n", (unsigned long)chunk_abs_offset);
+            send_to_all(&pkt, 7 + chunk_len);
+          }
+        } else {
+          /* 2 or more nodes missed this chunk: Send via Broadcast */
+          LOG_INFO("Retransmitting chunk %u broadcast (offset 0x%05lx, missed by %u nodes)\n",
+                   dist_chunk_idx, (unsigned long)chunk_abs_offset, missed_count);
+          send_to_all(&pkt, 7 + chunk_len);
+        }
+
+        /* Wait for 500 ms pacing delay between retransmissions */
+        etimer_set(&dist_timer, CLOCK_SECOND * 50 / 100);
+        PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
+      }
+    }
   }
 
   /* Advance to next page */

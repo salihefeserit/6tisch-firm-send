@@ -36,6 +36,24 @@ def send_command_with_ack(ser, cmd, expected_ack="FW:ACK", timeout=0.5):
         time.sleep(0.1) # Small delay before retry
     return False
 
+def handle_error_and_listen(ser, error_msg):
+    print(f"\n{error_msg}")
+    print("Entering passive listening mode to monitor logs. Press Ctrl+C to exit.")
+    try:
+        while True:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if line:
+                print(f"[Serial] {line}")
+                with open("coordinator.log", "a", encoding="utf-8") as f_log:
+                    f_log.write(line + "\n")
+            else:
+                time.sleep(0.01)
+    except KeyboardInterrupt:
+        print("\nExiting.")
+    finally:
+        ser.close()
+        sys.exit(1)
+
 def send_firmware(port, filename):
     if not os.path.exists(filename):
         print(f"Error: File {filename} not found.")
@@ -65,8 +83,7 @@ def send_firmware(port, filename):
     print("Sending START...")
     cmd = f"FW:S:{file_size:08X}\n"
     if not send_command_with_ack(ser, cmd, "FW:ACK", timeout=1.5):
-        print("Error: Coordinator did not ACK START command.")
-        sys.exit(1)
+        handle_error_and_listen(ser, "Error: Coordinator did not ACK START command.")
     print("START ACK received.")
 
     # Wait for sensor nodes to complete flash erase and resynchronize on period 61,
@@ -91,24 +108,21 @@ def send_firmware(port, filename):
             
             # Send chunk and wait for ACK (timeout 0.5s is safe, retries handled automatically)
             if not send_command_with_ack(ser, cmd, "FW:ACK", timeout=0.5):
-                print(f"Error: Failed to transmit chunk at offset 0x{chunk_offset:05X} after 5 attempts.")
-                sys.exit(1)
+                handle_error_and_listen(ser, f"Error: Failed to transmit chunk at offset 0x{chunk_offset:05X} after 5 attempts.")
             print(f"Sent chunk offset 0x{chunk_offset:05X} len {len(chunk)}")
             
         print("Page chunks sent. Waiting for network distribution (FW:PAGE_OK)...")
         
-        # Wait for page distribution confirmation (timeout 45s is safe to accommodate coordinator timeouts/retries)
-        if not send_command_with_ack(ser, "", "FW:PAGE_OK", timeout=45.0):
-            print("Error: Coordinator failed to distribute page within 45 seconds.")
-            sys.exit(1)
+        # Wait for page distribution confirmation (timeout 120s is safe to accommodate coordinator timeouts/retries and 500ms pacing)
+        if not send_command_with_ack(ser, "", "FW:PAGE_OK", timeout=120.0):
+            handle_error_and_listen(ser, "Error: Coordinator failed to distribute page within 120 seconds.")
         print("Page distribution complete.")
         
     # Send VERIFY
     print("Sending VERIFY...")
     cmd = f"FW:V:{checksum:08X}\n"
     if not send_command_with_ack(ser, cmd, "FW:ACK", timeout=2.0):
-        print("Error: Coordinator did not ACK VERIFY command.")
-        sys.exit(1)
+        handle_error_and_listen(ser, "Error: Coordinator did not ACK VERIFY command.")
     print("VERIFY ACK received.")
     
     # Wait for verification to complete and write logs to file

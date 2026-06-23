@@ -4,15 +4,13 @@
 #include "lib/random.h"
 #include "ota.h"
 #include "net/ipv6/uip-ds6-route.h"
+#include "net/ipv6/uip-ds6-nbr.h"
 
-static uip_ipaddr_t coordinator_ip;
-static uint8_t has_coordinator_ip = 0;
+/* Coordinator IP variables are no longer needed globally as they are derived from RPL root IP */
 
 static uint32_t current_rx_page_offset = 0xFFFFFFFF;
 static uint8_t page_bitmap[8];
-
-static uint32_t last_rx_page_offset = 0xFFFFFFFF;
-static uint8_t last_page_bitmap[8];
+static uint8_t page_0_erased = 0;
 
 static struct ctimer report_ctimer;
 static bitmap_report_t report_to_send;
@@ -54,7 +52,7 @@ static void do_forward(void *ptr) {
   fw_queue_count--;
   
   if (fw_queue_count > 0) {
-    clock_time_t delay = (random_rand() % 30 + 10) * CLOCK_SECOND / 1000;
+    clock_time_t delay = (random_rand() % 50 + 100) * CLOCK_SECOND / 1000;
     ctimer_set(&forward_ctimer, delay, do_forward, NULL);
   }
 }
@@ -72,26 +70,50 @@ static void schedule_forward(const fw_packet_t *pkt, uint16_t len) {
   fw_queue_count++;
   
   if (fw_queue_count == 1) {
-    clock_time_t delay = (random_rand() % 30 + 10) * CLOCK_SECOND / 1000;
+    clock_time_t delay = (random_rand() % 50 + 100) * CLOCK_SECOND / 1000;
     ctimer_set(&forward_ctimer, delay, do_forward, NULL);
   }
 }
 
-static void do_send_bitmap(void) {
-  if (node_id != 1 && has_coordinator_ip) {
-    uip_ipaddr_t dest;
-    
-    /* Always send to the learned link-local coordinator_ip first. For 1-hop nodes,
-     * this bypasses RPL routing tables entirely and is extremely robust under heavy traffic. */
-    simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &coordinator_ip);
+static int get_coordinator_ll_ip(uip_ipaddr_t *ip) {
+  uip_ipaddr_t root_ip;
+  if (NETSTACK_ROUTING.get_root_ipaddr != NULL &&
+      NETSTACK_ROUTING.get_root_ipaddr(&root_ip) &&
+      !uip_is_addr_unspecified(&root_ip)) {
+    uip_ipaddr_copy(ip, &root_ip);
+    memset(&ip->u8[0], 0, 8);
+    ip->u8[0] = 0xfe;
+    ip->u8[1] = 0x80;
+    return 1;
+  }
+  return 0;
+}
 
-    /* Also send to the global IP of the root for multi-hop forwarding if available. */
+static void do_send_bitmap(void) {
+  if (node_id != 1) {
+    uip_ipaddr_t root_ip;
     if (NETSTACK_ROUTING.get_root_ipaddr != NULL &&
-        NETSTACK_ROUTING.get_root_ipaddr(&dest) &&
-        !uip_is_addr_unspecified(&dest) &&
-        !uip_is_addr_linklocal(&dest)) {
-      if (memcmp(&dest, &coordinator_ip, sizeof(uip_ipaddr_t)) != 0) {
-        simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &dest);
+        NETSTACK_ROUTING.get_root_ipaddr(&root_ip) &&
+        !uip_is_addr_unspecified(&root_ip)) {
+      
+      uip_ipaddr_t coordinator_ll_ip;
+      uip_ipaddr_copy(&coordinator_ll_ip, &root_ip);
+      memset(&coordinator_ll_ip.u8[0], 0, 8);
+      coordinator_ll_ip.u8[0] = 0xfe;
+      coordinator_ll_ip.u8[1] = 0x80;
+
+      const uip_ipaddr_t *parent_ip = uip_ds6_defrt_choose();
+
+      /* We can only send directly via link-local if the coordinator is our preferred parent.
+       * Under Orchestra unicast_per_neighbor_rpl_storing, we only have dedicated unicast slots
+       * for our preferred parent and routing table entries (descendants). If we are 2+ hops away
+       * (our parent is another node), sending directly to the coordinator's link-local IP will get
+       * permanently stuck in the TSCH queue and cause buffer pool starvation. */
+      if (parent_ip != NULL && uip_ipaddr_cmp(parent_ip, &coordinator_ll_ip)) {
+        simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &coordinator_ll_ip);
+      } else {
+        /* If the coordinator is multi-hop, send via the global IP of the root to route it through RPL */
+        simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &root_ip);
       }
     }
   }
@@ -118,8 +140,8 @@ static void print_page_bitmap(void) {
     }
     printf("\n");
 
-    /* Send report to coordinator if IP is known and we are a sensor node */
-    if (node_id != 1 && has_coordinator_ip) {
+    /* Send report to coordinator if we are a sensor node */
+    if (node_id != 1) {
       report_to_send.type = PKT_TYPE_BITMAP_REPORT;
       report_to_send.page_offset = current_rx_page_offset;
       memcpy(report_to_send.bitmap, page_bitmap, sizeof(page_bitmap));
@@ -156,24 +178,31 @@ void udp_rx_callback(struct simple_udp_connection *c,
             }
           }
           if (found != -1) {
-            node_replied[found] = 1;
-            LOG_INFO("Marked node ");
-            LOG_INFO_6ADDR(sender_addr);
-            LOG_INFO_(" as replied.\n");
-            
-            /* Check if all session nodes have replied */
-            uint8_t all_replied = 1;
-            for (int i = 0; i < session_nodes_count; i++) {
-              if (!node_replied[i]) {
-                all_replied = 0;
-                break;
-              }
-            }
-            if (all_replied) {
-              LOG_INFO("All expected nodes replied. Notifying distribution process.\n");
-              process_post(&distribute_process, event_bitmap_received, NULL);
+            if (node_replied[found]) {
+              LOG_INFO("Duplicate bitmap report from ");
+              LOG_INFO_6ADDR(sender_addr);
+              LOG_INFO_(" ignored.\n");
             } else {
-              LOG_INFO("Still waiting for other nodes to reply.\n");
+              node_replied[found] = 1;
+              memcpy(session_bitmaps[found], report->bitmap, 8);
+              LOG_INFO("Marked node ");
+              LOG_INFO_6ADDR(sender_addr);
+              LOG_INFO_(" as replied.\n");
+              
+              /* Check if all session nodes have replied */
+              uint8_t all_replied = 1;
+              for (int i = 0; i < session_nodes_count; i++) {
+                if (!node_replied[i]) {
+                  all_replied = 0;
+                  break;
+                }
+              }
+              if (all_replied) {
+                LOG_INFO("All expected nodes replied. Notifying distribution process.\n");
+                process_post(&distribute_process, event_bitmap_received, NULL);
+              } else {
+                LOG_INFO("Still waiting for other nodes to reply.\n");
+              }
             }
           } else {
             LOG_WARN("Received bitmap report from unexpected/dropped node: ");
@@ -190,22 +219,14 @@ void udp_rx_callback(struct simple_udp_connection *c,
     LOG_INFO("[DEBUG] Rx UDP: len %u, type %u\n", datalen, data[0]);
   }
 
-  /* Sensor node: learn coordinator IP from the first incoming packet.
-   * This is used as a fallback; the actual send destination is resolved
-   * at send time via RPL (see send_report_callback). */
-  if (!has_coordinator_ip) {
-    uip_ipaddr_copy(&coordinator_ip, sender_addr);
-    has_coordinator_ip = 1;
-    LOG_INFO("Learned coordinator IP from sender: ");
-    LOG_INFO_6ADDR(&coordinator_ip);
-    LOG_INFO_("\n");
-  }
-
   if (datalen < 7) {
     return; /* Too small to be fw_packet_t header */
   }
 
   const fw_packet_t *pkt = (const fw_packet_t *)data;
+
+  uip_ipaddr_t coordinator_ll_ip;
+  int has_coord_ll = get_coordinator_ll_ip(&coordinator_ll_ip);
 
   /* Determine if this packet should be forwarded based on RPL parent.
    * A node only forwards downward traffic originating from the root (coordinator)
@@ -213,8 +234,21 @@ void udp_rx_callback(struct simple_udp_connection *c,
    * Additionally, leaf nodes (nodes with no downstream routes) do not need to forward. */
   const uip_ipaddr_t *parent_ip = uip_ds6_defrt_choose();
   uint8_t is_from_parent = (parent_ip != NULL && uip_ipaddr_cmp(sender_addr, parent_ip));
-  uint8_t is_from_coordinator = (has_coordinator_ip && uip_ipaddr_cmp(sender_addr, &coordinator_ip));
-  uint8_t is_leaf = (uip_ds6_route_head() == NULL);
+  uint8_t is_from_coordinator = (has_coord_ll && uip_ipaddr_cmp(sender_addr, &coordinator_ll_ip));
+  
+  /* Determine if we are a leaf node by checking the neighbor cache.
+   * If all our neighbors are either the coordinator or our parent, then we are a leaf node. */
+  uint8_t is_leaf = 1;
+  uip_ds6_nbr_t *nbr;
+  for(nbr = uip_ds6_nbr_head(); nbr != NULL; nbr = uip_ds6_nbr_next(nbr)) {
+    int is_coord = (has_coord_ll && uip_ipaddr_cmp(&nbr->ipaddr, &coordinator_ll_ip));
+    int is_parent = (parent_ip != NULL && uip_ipaddr_cmp(&nbr->ipaddr, parent_ip));
+    if(!is_coord && !is_parent) {
+      is_leaf = 0;
+      break;
+    }
+  }
+
   uint8_t should_forward = (is_from_parent || is_from_coordinator) && !is_leaf;
 
   if (pkt->type == PKT_TYPE_START) {
@@ -225,8 +259,7 @@ void udp_rx_callback(struct simple_udp_connection *c,
     /* Reset bitmap variables */
     current_rx_page_offset = 0xFFFFFFFF;
     memset(page_bitmap, 0, sizeof(page_bitmap));
-    last_rx_page_offset = 0xFFFFFFFF;
-    memset(last_page_bitmap, 0, sizeof(last_page_bitmap));
+    page_0_erased = 0;
 
     if (ext_flash_open(NULL)) {
       /* Erase the first sector eagerly at START so the flash is ready before
@@ -234,6 +267,7 @@ void udp_rx_callback(struct simple_udp_connection *c,
        * the first page from UART, giving the erase time to complete. */
       LOG_INFO("Erasing initial sector at 0x00000...\n");
       ext_flash_erase(NULL, 0x00000, EXT_FLASH_ERASE_SECTOR_SIZE);
+      page_0_erased = 1;
       ext_flash_close(NULL);
     } else {
       LOG_INFO("[ERROR] Failed to open flash!\n");
@@ -255,30 +289,56 @@ void udp_rx_callback(struct simple_udp_connection *c,
 
     uint32_t page_offset =
         pkt->offset - (pkt->offset % EXT_FLASH_ERASE_SECTOR_SIZE);
-        
-    /* If receiving the next page's data, clear the last completed page backup */
-    if (page_offset != last_rx_page_offset) {
-      last_rx_page_offset = 0xFFFFFFFF;
-      memset(last_page_bitmap, 0, sizeof(last_page_bitmap));
-    }
 
     if (current_rx_page_offset == 0xFFFFFFFF) {
       current_rx_page_offset = page_offset;
       memset(page_bitmap, 0, sizeof(page_bitmap));
+
+      if (page_offset == 0) {
+        if (!page_0_erased) {
+          if (ext_flash_open(NULL)) {
+            LOG_WARN("[OTA] Self-healing: Erasing sector 0...\n");
+            ext_flash_erase(NULL, 0, EXT_FLASH_ERASE_SECTOR_SIZE);
+            page_0_erased = 1;
+            ext_flash_close(NULL);
+          } else {
+            LOG_INFO("[ERROR] Failed to open flash for self-healing erase!\n");
+          }
+        }
+      } else {
+        if (ext_flash_open(NULL)) {
+          LOG_INFO("[OTA] Erasing sector for page 0x%05lx...\n", (unsigned long)page_offset);
+          ext_flash_erase(NULL, page_offset, EXT_FLASH_ERASE_SECTOR_SIZE);
+          ext_flash_close(NULL);
+        } else {
+          LOG_INFO("[ERROR] Failed to open flash for page erase!\n");
+        }
+      }
+    } else if (page_offset > current_rx_page_offset) {
+      /* Transition to the next page */
+      current_rx_page_offset = page_offset;
+      memset(page_bitmap, 0, sizeof(page_bitmap));
+
+      if (ext_flash_open(NULL)) {
+        LOG_INFO("[OTA] Transitioning to page 0x%05lx: Erasing sector...\n", (unsigned long)page_offset);
+        ext_flash_erase(NULL, page_offset, EXT_FLASH_ERASE_SECTOR_SIZE);
+        ext_flash_close(NULL);
+      } else {
+        LOG_INFO("[ERROR] Failed to open flash for page transition erase!\n");
+      }
+    } else if (page_offset < current_rx_page_offset) {
+      /* Ignore data for an older page */
+      LOG_WARN("[OTA] Ignored DATA for older page: offset 0x%05lx (current page: 0x%05lx)\n",
+               (unsigned long)page_offset, (unsigned long)current_rx_page_offset);
+      return;
     }
 
     /* Check if this chunk is already received to avoid duplicate write to flash */
     uint8_t chunk_already_received = 0;
     uint16_t chunk_idx = (pkt->offset % EXT_FLASH_ERASE_SECTOR_SIZE) / 64;
     if (chunk_idx < 64) {
-      if (current_rx_page_offset == page_offset) {
-        if ((page_bitmap[chunk_idx / 8] & (1 << (chunk_idx % 8))) != 0) {
-          chunk_already_received = 1;
-        }
-      } else if (last_rx_page_offset == page_offset) {
-        if ((last_page_bitmap[chunk_idx / 8] & (1 << (chunk_idx % 8))) != 0) {
-          chunk_already_received = 1;
-        }
+      if ((page_bitmap[chunk_idx / 8] & (1 << (chunk_idx % 8))) != 0) {
+        chunk_already_received = 1;
       }
     }
 
@@ -296,21 +356,6 @@ void udp_rx_callback(struct simple_udp_connection *c,
       }
 
       if (ext_flash_open(NULL)) {
-        /* Erase the sector when crossing a boundary.
-         * Sector 0 is already erased eagerly in the START handler so the
-         * `offset > 0` guard prevents a redundant (and blocking) re-erase. */
-        if (pkt->offset > 0 && (pkt->offset % EXT_FLASH_ERASE_SECTOR_SIZE) == 0) {
-          LOG_INFO("Erasing sector at 0x%05lx...\n", (unsigned long)pkt->offset);
-          ext_flash_erase(NULL, pkt->offset, EXT_FLASH_ERASE_SECTOR_SIZE);
-        } else if ((pkt->offset % EXT_FLASH_ERASE_SECTOR_SIZE) + pkt->length >
-                   EXT_FLASH_ERASE_SECTOR_SIZE) {
-          /* If a single write crosses a boundary, erase next sector */
-          uint32_t next_sector = (pkt->offset / EXT_FLASH_ERASE_SECTOR_SIZE + 1) *
-                                 EXT_FLASH_ERASE_SECTOR_SIZE;
-          LOG_INFO("Erasing sector at 0x%05lx...\n", (unsigned long)next_sector);
-          ext_flash_erase(NULL, next_sector, EXT_FLASH_ERASE_SECTOR_SIZE);
-        }
-
         ext_flash_write(NULL, pkt->offset, pkt->length, pkt->data);
         ext_flash_close(NULL);
       }
@@ -318,30 +363,34 @@ void udp_rx_callback(struct simple_udp_connection *c,
   } else if (pkt->type == PKT_TYPE_PAGE_END) {
     LOG_INFO("[OTA] PAGE_END received for offset 0x%05lx\n", (unsigned long)pkt->offset);
     
+    /* Debug print routes */
+    uip_ds6_route_t *r;
+    LOG_INFO("[DEBUG] Routing table dump:\n");
+    int route_cnt = 0;
+    for(r = uip_ds6_route_head(); r != NULL; r = uip_ds6_route_next(r)) {
+      LOG_INFO("  - Route to: ");
+      LOG_INFO_6ADDR(&r->ipaddr);
+      LOG_INFO_("\n");
+      route_cnt++;
+    }
+    LOG_INFO("[DEBUG] Total routes: %d\n", route_cnt);
+    
     /* Controlled flooding: Forward PAGE_END if from parent or coordinator */
     if (should_forward) {
       schedule_forward(pkt, datalen);
     }
 
     if (pkt->offset == current_rx_page_offset) {
-      /* Save to last completed page backup variables */
-      last_rx_page_offset = current_rx_page_offset;
-      memcpy(last_page_bitmap, page_bitmap, sizeof(page_bitmap));
-      
       /* Print and send the report */
       print_page_bitmap();
-      
-      /* Reset current page state to be ready for the next page */
-      current_rx_page_offset = 0xFFFFFFFF;
-    } else if (pkt->offset == last_rx_page_offset) {
-      /* Retransmission request from coordinator. Send the last backup report */
-      LOG_INFO("[OTA] Retransmitting bitmap report for page 0x%05lx\n", (unsigned long)last_rx_page_offset);
-      if (has_coordinator_ip) {
-        report_to_send.type = PKT_TYPE_BITMAP_REPORT;
-        report_to_send.page_offset = last_rx_page_offset;
-        memcpy(report_to_send.bitmap, last_page_bitmap, sizeof(last_page_bitmap));
-        schedule_bitmap_send();
-      }
+    } else if (current_rx_page_offset == 0xFFFFFFFF && pkt->offset == 0) {
+      current_rx_page_offset = 0;
+      memset(page_bitmap, 0, sizeof(page_bitmap));
+      print_page_bitmap();
+    } else if (pkt->offset > current_rx_page_offset && current_rx_page_offset != 0xFFFFFFFF) {
+      current_rx_page_offset = pkt->offset;
+      memset(page_bitmap, 0, sizeof(page_bitmap));
+      print_page_bitmap();
     }
   } else if (pkt->type == PKT_TYPE_VERIFY) {
     LOG_INFO("[OTA] VERIFY request received! Expected CRC: 0x%08lx\n",

@@ -3,3 +3,5 @@ build/
 coordinator.bin
 sensor-node.bin
 coordinator.log
+sensor-node1.log
+sensor-node2.log
