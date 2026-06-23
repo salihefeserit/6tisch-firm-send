@@ -11,6 +11,7 @@ PLATFORMS_EXCLUDE = sky native z1
 # Simple Energest
 MODULES += $(CONTIKI_NG_SERVICES_DIR)/simple-energest
 MODULES += arch/dev/storage/ext-flash
+PROJECT_SOURCEFILES += ota-common.c coordinator.c sensor-node.c
 
 CONTIKI=../../..
 

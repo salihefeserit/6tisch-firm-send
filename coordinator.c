@@ -1,0 +1,273 @@
+#define LOG_MODULE "App"
+#define LOG_LEVEL LOG_LEVEL_INFO
+#include "sys/log.h"
+#include "net/ipv6/uip-ds6-route.h"
+#include "net/ipv6/uip-ds6.h"
+#include "ota.h"
+
+uip_ipaddr_t session_nodes[MAX_NODES];
+uint8_t session_nodes_count = 0;
+uint8_t node_replied[MAX_NODES];
+uint8_t retry_count = 0;
+
+process_event_t event_bitmap_received;
+
+PROCESS(distribute_process, "OTA Distribution Process");
+
+int ota_coordinator_has_routes(void) {
+  return tsch_is_associated && (uip_ds6_route_head() != NULL);
+}
+
+/* Process thread for distributing a page to all nodes */
+PROCESS_THREAD(distribute_process, ev, data) {
+  static struct etimer dist_timer;
+  static uint16_t dist_chunk_idx;
+  static uint16_t total_chunks;
+  static fw_packet_t end_pkt;
+
+  PROCESS_BEGIN();
+
+  total_chunks = (expected_page_size + 63) / 64;
+  LOG_INFO("Distributing page at offset 0x%05lx, total chunks: %u\n",
+           (unsigned long)page_start_offset, total_chunks);
+
+  for (dist_chunk_idx = 0; dist_chunk_idx < total_chunks; dist_chunk_idx++) {
+    uint32_t chunk_abs_offset = page_start_offset + dist_chunk_idx * 64;
+    uint16_t chunk_len = 64;
+    if (chunk_abs_offset + chunk_len > page_start_offset + expected_page_size) {
+      chunk_len = (page_start_offset + expected_page_size) - chunk_abs_offset;
+    }
+
+    fw_packet_t pkt;
+    pkt.type = PKT_TYPE_DATA;
+    pkt.offset = chunk_abs_offset;
+    pkt.length = chunk_len;
+    memcpy(pkt.data, &page_buffer[dist_chunk_idx * 64], chunk_len);
+
+    send_to_all(&pkt, 7 + chunk_len);
+    LOG_INFO("Distributed chunk %u/%u: offset 0x%05lx, len %u\n",
+             dist_chunk_idx + 1, total_chunks, (unsigned long)chunk_abs_offset,
+             chunk_len);
+
+    /* Wait for 250 ms to avoid network congestion and queue overflows */
+    etimer_set(&dist_timer, CLOCK_SECOND * 25 / 100);
+    PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
+  }
+
+  LOG_INFO("Page distribution complete for offset 0x%05lx\n",
+           (unsigned long)page_start_offset);
+
+  /* Reset reply tracking for all session nodes */
+  memset(node_replied, 0, sizeof(node_replied));
+  retry_count = 0;
+
+  if (session_nodes_count > 0) {
+    LOG_INFO("Expecting reports from %u nodes for page 0x%05lx:\n", session_nodes_count, (unsigned long)page_start_offset);
+    for(int i = 0; i < session_nodes_count; i++) {
+      LOG_INFO("  - ");
+      LOG_INFO_6ADDR(&session_nodes[i]);
+      LOG_INFO_("\n");
+    }
+
+    /* Broadcast PAGE_END packet */
+    end_pkt.type = PKT_TYPE_PAGE_END;
+    end_pkt.offset = page_start_offset;
+    end_pkt.length = 0;
+    send_to_all(&end_pkt, 7);
+    LOG_INFO("Sent PAGE_END for offset 0x%05lx, waiting for bitmap...\n", (unsigned long)page_start_offset);
+
+    /* Wait for bitmap report (or timeout of 5.0 seconds) */
+    etimer_set(&dist_timer, CLOCK_SECOND * 5);
+    while (1) {
+      PROCESS_WAIT_EVENT();
+      if (ev == PROCESS_EVENT_TIMER && data == &dist_timer) {
+        retry_count++;
+        
+        /* Print pending nodes */
+        LOG_INFO("Timeout (%d/5) waiting for reports. Pending nodes:\n", retry_count);
+        for(int i = 0; i < session_nodes_count; i++) {
+          if(!node_replied[i]) {
+            LOG_INFO("  - ");
+            LOG_INFO_6ADDR(&session_nodes[i]);
+            LOG_INFO_("\n");
+          }
+        }
+
+        if (retry_count >= 5) {
+          /* Check if at least one node replied */
+          uint8_t replied_count = 0;
+          for(int i = 0; i < session_nodes_count; i++) {
+            if(node_replied[i]) {
+              replied_count++;
+            }
+          }
+
+          if(replied_count > 0) {
+            LOG_INFO("Max retries reached. Dropping unresponsive nodes:\n");
+            /* Drop unresponsive nodes by compacting session_nodes array */
+            int write_idx = 0;
+            for(int i = 0; i < session_nodes_count; i++) {
+              if(node_replied[i]) {
+                if(write_idx != i) {
+                  uip_ipaddr_copy(&session_nodes[write_idx], &session_nodes[i]);
+                }
+                write_idx++;
+              } else {
+                LOG_INFO("  - Dropped: ");
+                LOG_INFO_6ADDR(&session_nodes[i]);
+                LOG_INFO_("\n");
+              }
+            }
+            session_nodes_count = write_idx;
+            break; /* Proceed to next page */
+          } else {
+            LOG_WARN("Max retries reached but 0 nodes replied. Resetting retry count and continuing to wait...\n");
+            retry_count = 0;
+          }
+        }
+        
+        LOG_INFO("Sending PAGE_END again...\n");
+        send_to_all(&end_pkt, 7);
+        etimer_set(&dist_timer, CLOCK_SECOND * 5);
+      } else if (ev == event_bitmap_received) {
+        LOG_INFO("Bitmap received from all nodes! Proceeding to next page.\n");
+        break;
+      }
+    }
+  } else {
+    LOG_INFO("No active nodes tracked in this session. Skipping wait for bitmap reports.\n");
+  }
+
+  /* Advance to next page */
+  page_start_offset += expected_page_size;
+  page_bytes_received = 0;
+  if (page_start_offset < current_file_size) {
+    expected_page_size = (current_file_size - page_start_offset > PAGE_SIZE)
+                             ? PAGE_SIZE
+                             : (current_file_size - page_start_offset);
+  } else {
+    expected_page_size = 0;
+  }
+  distribution_in_progress = 0;
+
+  /* Print FW:PAGE_OK to serial line to notify python script */
+  printf("FW:PAGE_OK\n");
+
+  PROCESS_END();
+}
+
+/* Parse and process incoming firmware commands over UART */
+void ota_coordinator_handle_uart(const char *str) {
+  extern struct process serial_shell_process;
+  uint32_t offset;
+  unsigned int length;
+  static char hexdata[130];
+
+  memset(hexdata, 0, sizeof(hexdata));
+
+  if (str[3] == 'S') {
+    /* Stop the serial shell to prevent 'Command not found' outputs
+     * during transmission */
+    if (process_is_running(&serial_shell_process)) {
+      process_exit(&serial_shell_process);
+    }
+    if (sscanf(str, "FW:S:%lx", &offset) == 1) {
+      fw_packet_t pkt;
+      pkt.type = PKT_TYPE_START;
+      pkt.offset = offset;
+      pkt.length = 0;
+      send_to_all(&pkt, 7); /* 7 is offsetof(fw_packet_t, data) */
+      LOG_INFO("Sent START, size: %lu\n", (unsigned long)offset);
+
+      /* Populate session nodes from RPL routing table */
+      session_nodes_count = 0;
+      uip_ds6_route_t *route;
+      for(route = uip_ds6_route_head(); route != NULL; route = uip_ds6_route_next(route)) {
+        if(session_nodes_count < MAX_NODES) {
+          uip_ipaddr_copy(&session_nodes[session_nodes_count], &route->ipaddr);
+          session_nodes_count++;
+        } else {
+          LOG_WARN("Too many routing entries! Truncating to MAX_NODES (%d)\n", MAX_NODES);
+          break;
+        }
+      }
+      if(session_nodes_count == 0) {
+        LOG_WARN("No active routes at session start!\n");
+      } else {
+        LOG_INFO("Session started with %u active nodes:\n", session_nodes_count);
+        for(int i = 0; i < session_nodes_count; i++) {
+          LOG_INFO("  - ");
+          LOG_INFO_6ADDR(&session_nodes[i]);
+          LOG_INFO_("\n");
+        }
+      }
+
+      /* Initialize page variables */
+      current_file_size = offset;
+      page_start_offset = 0;
+      page_bytes_received = 0;
+      expected_page_size = (current_file_size > PAGE_SIZE)
+                               ? PAGE_SIZE
+                               : current_file_size;
+      distribution_in_progress = 0;
+
+      /* Acknowledge START command */
+      printf("FW:ACK\n");
+    }
+  } else if (str[3] == 'D') {
+    if (sscanf(str, "FW:D:%lx:%x:%128s", &offset, &length, hexdata) >= 3) {
+      set_shared_period(11); /* Switch to fast period on data transmission */
+
+      if (distribution_in_progress) {
+        LOG_INFO("[ERROR] Page distribution in progress, ignoring UART chunk!\n");
+      } else if (offset >= page_start_offset &&
+                 offset < page_start_offset + expected_page_size) {
+        uint32_t rel_offset = offset - page_start_offset;
+        if (rel_offset + length <= expected_page_size) {
+          for (int i = 0; i < length; i++) {
+            page_buffer[rel_offset + i] =
+                (hex2val(hexdata[i * 2]) << 4) |
+                hex2val(hexdata[i * 2 + 1]);
+          }
+          page_bytes_received += length;
+          LOG_INFO("Buffered chunk offset 0x%05lx, len %u. Progress: %u/%u\n",
+                   (unsigned long)offset, length, page_bytes_received,
+                   expected_page_size);
+
+          /* Acknowledge successful buffering of this chunk */
+          printf("FW:ACK\n");
+
+          if (page_bytes_received == expected_page_size) {
+            distribution_in_progress = 1;
+            process_start(&distribute_process, NULL);
+          }
+        } else {
+          LOG_INFO("[ERROR] Chunk write exceeds page boundary!\n");
+        }
+      } else {
+        LOG_INFO("[ERROR] Chunk offset 0x%05lx out of bounds for page starting at 0x%05lx\n",
+                 (unsigned long)offset, (unsigned long)page_start_offset);
+      }
+    }
+  } else if (str[3] == 'V') {
+    if (sscanf(str, "FW:V:%lx", &offset) == 1) {
+      fw_packet_t pkt;
+      pkt.type = PKT_TYPE_VERIFY;
+      pkt.offset = offset;
+      pkt.length = 0;
+      send_to_all(&pkt, 7);
+      LOG_INFO("Sent VERIFY, expected checksum: 0x%08lx\n",
+               (unsigned long)offset);
+
+      /* Acknowledge VERIFY command */
+      printf("FW:ACK\n");
+
+      reset_ota_timer(); /* Let the timeout timer return us to normal 61 period */
+
+      /* Restart the serial shell now that transmission is complete */
+      if (!process_is_running(&serial_shell_process)) {
+        process_start(&serial_shell_process, NULL);
+      }
+    }
+  }
+}

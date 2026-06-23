@@ -97,9 +97,9 @@ def send_firmware(port, filename):
             
         print("Page chunks sent. Waiting for network distribution (FW:PAGE_OK)...")
         
-        # Wait for page distribution confirmation (timeout 25s is safe for 128 chunks * 150ms)
-        if not send_command_with_ack(ser, "", "FW:PAGE_OK", timeout=25.0):
-            print("Error: Coordinator failed to distribute page within 25 seconds.")
+        # Wait for page distribution confirmation (timeout 45s is safe to accommodate coordinator timeouts/retries)
+        if not send_command_with_ack(ser, "", "FW:PAGE_OK", timeout=45.0):
+            print("Error: Coordinator failed to distribute page within 45 seconds.")
             sys.exit(1)
         print("Page distribution complete.")
         
