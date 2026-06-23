@@ -109,28 +109,33 @@ static uint8_t retry_count = 0;
 static struct ctimer report_ctimer;
 static bitmap_report_t report_to_send;
 
-static void send_report_callback(void *ptr) {
+static void do_send_bitmap(void) {
   if (node_id != 1 && has_coordinator_ip) {
     uip_ipaddr_t dest;
-    /* Prefer the RPL root's GLOBAL address for reliable multi-hop routing.
-     * The stored coordinator_ip may be a link-local address (from multicast
-     * sender_addr) which cannot be routed beyond one hop. */
+    /* Prefer the RPL root's GLOBAL address for reliable multi-hop routing. */
     if (NETSTACK_ROUTING.get_root_ipaddr != NULL &&
         NETSTACK_ROUTING.get_root_ipaddr(&dest) &&
         !uip_is_addr_unspecified(&dest) &&
         !uip_is_addr_linklocal(&dest)) {
-      LOG_INFO("[OTA] Sending bitmap to RPL root (global): ");
-      LOG_INFO_6ADDR(&dest);
-      LOG_INFO_("\n");
       simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &dest);
       return;
     }
-    /* Fallback: use the learned coordinator_ip */
-    LOG_INFO("[OTA] Sending bitmap to coordinator IP (fallback): ");
-    LOG_INFO_6ADDR(&coordinator_ip);
-    LOG_INFO_("\n");
     simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &coordinator_ip);
   }
+}
+
+static void send_report_callback(void *ptr) {
+  LOG_INFO("[OTA] Sending bitmap report\n");
+  do_send_bitmap();
+}
+
+/* Schedule bitmap transmission with a staggered random delay so that
+ * nodes do not transmit at the exact same time and collide. */
+static void schedule_bitmap_send(void) {
+  clock_time_t delay = (random_rand() % 500) * CLOCK_SECOND / 1000;
+  LOG_INFO("[OTA] Scheduling bitmap send in %lu ms\n",
+           (unsigned long)(delay * 1000 / CLOCK_SECOND));
+  ctimer_set(&report_ctimer, delay, send_report_callback, NULL);
 }
 
 static void print_page_bitmap(void) {
@@ -147,14 +152,17 @@ static void print_page_bitmap(void) {
       report_to_send.type = PKT_TYPE_BITMAP_REPORT;
       report_to_send.page_offset = current_rx_page_offset;
       memcpy(report_to_send.bitmap, page_bitmap, sizeof(page_bitmap));
-      
-      clock_time_t delay = (random_rand() % 1500) * CLOCK_SECOND / 1000;
-      LOG_INFO("[OTA] Scheduling bitmap report send in %lu ms\n", (unsigned long)(delay * 1000 / CLOCK_SECOND));
-      ctimer_set(&report_ctimer, delay, send_report_callback, NULL);
+      schedule_bitmap_send();
     }
   }
 }
 
+/*---------------------------------------------------------------------------*/
+static struct ctimer start_delay_ctimer;
+static void start_delay_callback(void *ptr) {
+  LOG_INFO("[OTA] Start delay complete, switching to period 11\n");
+  set_shared_period(11);
+}
 /*---------------------------------------------------------------------------*/
 /* UDP receive callback for Sensor Node */
 static void udp_rx_callback(struct simple_udp_connection *c,
@@ -236,7 +244,6 @@ static void udp_rx_callback(struct simple_udp_connection *c,
   const fw_packet_t *pkt = (const fw_packet_t *)data;
 
   if (pkt->type == PKT_TYPE_START) {
-    set_shared_period(11);
     LOG_INFO("[OTA] START received. File size: %lu\n",
              (unsigned long)pkt->offset);
     current_file_size = pkt->offset;
@@ -248,13 +255,20 @@ static void udp_rx_callback(struct simple_udp_connection *c,
     memset(last_page_bitmap, 0, sizeof(last_page_bitmap));
 
     if (ext_flash_open(NULL)) {
-      /* Erase the first sector */
+      /* Erase the first sector eagerly at START so the flash is ready before
+       * distribution begins. The coordinator needs several seconds to buffer
+       * the first page from UART, giving the erase time to complete. */
       LOG_INFO("Erasing initial sector at 0x00000...\n");
       ext_flash_erase(NULL, 0x00000, EXT_FLASH_ERASE_SECTOR_SIZE);
       ext_flash_close(NULL);
     } else {
       LOG_INFO("[ERROR] Failed to open flash!\n");
     }
+
+    /* Set a 5-second ctimer to switch to period 11. This allows the node
+     * to finish the flash erase and fully resynchronize with the coordinator
+     * on period 61 before transitioning to period 11. */
+    ctimer_set(&start_delay_ctimer, CLOCK_SECOND * 5, start_delay_callback, NULL);
   } else if (pkt->type == PKT_TYPE_DATA) {
     set_shared_period(11); /* Reset timeout timer and ensure fast period */
     LOG_INFO("[OTA] DATA received: offset 0x%05lx, len %u\n",
@@ -282,7 +296,9 @@ static void udp_rx_callback(struct simple_udp_connection *c,
     }
 
     if (ext_flash_open(NULL)) {
-      /* If crossing a sector boundary, erase the new sector */
+      /* Erase the sector when crossing a boundary.
+       * Sector 0 is already erased eagerly in the START handler so the
+       * `offset > 0` guard prevents a redundant (and blocking) re-erase. */
       if (pkt->offset > 0 && (pkt->offset % EXT_FLASH_ERASE_SECTOR_SIZE) == 0) {
         LOG_INFO("Erasing sector at 0x%05lx...\n", (unsigned long)pkt->offset);
         ext_flash_erase(NULL, pkt->offset, EXT_FLASH_ERASE_SECTOR_SIZE);
@@ -317,10 +333,7 @@ static void udp_rx_callback(struct simple_udp_connection *c,
         report_to_send.type = PKT_TYPE_BITMAP_REPORT;
         report_to_send.page_offset = last_rx_page_offset;
         memcpy(report_to_send.bitmap, last_page_bitmap, sizeof(last_page_bitmap));
-        
-        clock_time_t delay = (random_rand() % 1500) * CLOCK_SECOND / 1000;
-        LOG_INFO("[OTA] Scheduling backup report retransmit in %lu ms\n", (unsigned long)(delay * 1000 / CLOCK_SECOND));
-        ctimer_set(&report_ctimer, delay, send_report_callback, NULL);
+        schedule_bitmap_send();
       }
     }
   } else if (pkt->type == PKT_TYPE_VERIFY) {
@@ -414,6 +427,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
   total_chunks = (expected_page_size + 63) / 64;
   LOG_INFO("Distributing page at offset 0x%05lx, total chunks: %u\n",
            (unsigned long)page_start_offset, total_chunks);
+
+
 
   for (dist_chunk_idx = 0; dist_chunk_idx < total_chunks; dist_chunk_idx++) {
     uint32_t chunk_abs_offset = page_start_offset + dist_chunk_idx * 64;

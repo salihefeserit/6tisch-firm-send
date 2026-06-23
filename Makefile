@@ -63,7 +63,7 @@ MAKE_WITH_STORING_ROUTING ?= 1
 # Orchestra link-based rule? (Works only if Orchestra & storing mode routing is enabled)
 MAKE_WITH_LINK_BASED_ORCHESTRA ?= 0
 # Use the Orchestra root rule?
-MAKE_WITH_ORCHESTRA_ROOT_RULE ?= 0
+MAKE_WITH_ORCHESTRA_ROOT_RULE ?= 1
 
 MAKE_MAC = MAKE_MAC_TSCH
 

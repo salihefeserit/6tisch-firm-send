@@ -68,7 +68,12 @@ def send_firmware(port, filename):
         print("Error: Coordinator did not ACK START command.")
         sys.exit(1)
     print("START ACK received.")
-    
+
+    # Wait for sensor nodes to complete flash erase and resynchronize on period 61,
+    # before they transition to period 11.
+    print("Waiting 5 seconds for nodes to complete sector 0 erase and stabilize TSCH...")
+    time.sleep(5.0)
+
     # Send DATA chunks in pages
     page_size = 4096
     chunk_size = 32
