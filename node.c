@@ -111,7 +111,24 @@ static bitmap_report_t report_to_send;
 
 static void send_report_callback(void *ptr) {
   if (node_id != 1 && has_coordinator_ip) {
-    LOG_INFO("[OTA] Sending delayed bitmap report...\n");
+    uip_ipaddr_t dest;
+    /* Prefer the RPL root's GLOBAL address for reliable multi-hop routing.
+     * The stored coordinator_ip may be a link-local address (from multicast
+     * sender_addr) which cannot be routed beyond one hop. */
+    if (NETSTACK_ROUTING.get_root_ipaddr != NULL &&
+        NETSTACK_ROUTING.get_root_ipaddr(&dest) &&
+        !uip_is_addr_unspecified(&dest) &&
+        !uip_is_addr_linklocal(&dest)) {
+      LOG_INFO("[OTA] Sending bitmap to RPL root (global): ");
+      LOG_INFO_6ADDR(&dest);
+      LOG_INFO_("\n");
+      simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &dest);
+      return;
+    }
+    /* Fallback: use the learned coordinator_ip */
+    LOG_INFO("[OTA] Sending bitmap to coordinator IP (fallback): ");
+    LOG_INFO_6ADDR(&coordinator_ip);
+    LOG_INFO_("\n");
     simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &coordinator_ip);
   }
 }
@@ -201,11 +218,13 @@ static void udp_rx_callback(struct simple_udp_connection *c,
     LOG_INFO("[DEBUG] Rx UDP: len %u, type %u\n", datalen, data[0]);
   }
 
-  /* Sensor node: learn/verify coordinator IP from incoming packets */
+  /* Sensor node: learn coordinator IP from the first incoming packet.
+   * This is used as a fallback; the actual send destination is resolved
+   * at send time via RPL (see send_report_callback). */
   if (!has_coordinator_ip) {
     uip_ipaddr_copy(&coordinator_ip, sender_addr);
     has_coordinator_ip = 1;
-    LOG_INFO("Learned coordinator IP: ");
+    LOG_INFO("Learned coordinator IP from sender: ");
     LOG_INFO_6ADDR(&coordinator_ip);
     LOG_INFO_("\n");
   }
