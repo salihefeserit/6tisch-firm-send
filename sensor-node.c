@@ -1,16 +1,19 @@
 #define LOG_MODULE "App"
 #define LOG_LEVEL LOG_LEVEL_INFO
-#include "sys/log.h"
 #include "lib/random.h"
-#include "ota.h"
-#include "net/ipv6/uip-ds6-route.h"
 #include "net/ipv6/uip-ds6-nbr.h"
+#include "net/ipv6/uip-ds6-route.h"
+#include "ota.h"
+#include "sys/log.h"
 
-/* Coordinator IP variables are no longer needed globally as they are derived from RPL root IP */
+/* Coordinator IP variables are no longer needed globally as they are derived
+ * from RPL root IP */
 
 static uint32_t current_rx_page_offset = 0xFFFFFFFF;
 static uint8_t page_bitmap[8];
 static uint8_t page_0_erased = 0;
+
+static uint16_t running_fw_crc = 0;
 
 static struct ctimer report_ctimer;
 static bitmap_report_t report_to_send;
@@ -21,8 +24,6 @@ static void start_delay_callback(void *ptr) {
   LOG_INFO("[OTA] Start delay complete, switching to period 11\n");
   set_shared_period(11);
 }
-
-
 
 static int get_coordinator_ll_ip(uip_ipaddr_t *ip) {
   uip_ipaddr_t root_ip;
@@ -44,7 +45,7 @@ static void do_send_bitmap(void) {
     if (NETSTACK_ROUTING.get_root_ipaddr != NULL &&
         NETSTACK_ROUTING.get_root_ipaddr(&root_ip) &&
         !uip_is_addr_unspecified(&root_ip)) {
-      
+
       uip_ipaddr_t coordinator_ll_ip;
       uip_ipaddr_copy(&coordinator_ll_ip, &root_ip);
       memset(&coordinator_ll_ip.u8[0], 0, 8);
@@ -53,16 +54,21 @@ static void do_send_bitmap(void) {
 
       const uip_ipaddr_t *parent_ip = uip_ds6_defrt_choose();
 
-      /* We can only send directly via link-local if the coordinator is our preferred parent.
-       * Under Orchestra unicast_per_neighbor_rpl_storing, we only have dedicated unicast slots
-       * for our preferred parent and routing table entries (descendants). If we are 2+ hops away
-       * (our parent is another node), sending directly to the coordinator's link-local IP will get
-       * permanently stuck in the TSCH queue and cause buffer pool starvation. */
+      /* We can only send directly via link-local if the coordinator is our
+       * preferred parent. Under Orchestra unicast_per_neighbor_rpl_storing, we
+       * only have dedicated unicast slots for our preferred parent and routing
+       * table entries (descendants). If we are 2+ hops away (our parent is
+       * another node), sending directly to the coordinator's link-local IP will
+       * get permanently stuck in the TSCH queue and cause buffer pool
+       * starvation. */
       if (parent_ip != NULL && uip_ipaddr_cmp(parent_ip, &coordinator_ll_ip)) {
-        simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &coordinator_ll_ip);
+        simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send),
+                          &coordinator_ll_ip);
       } else {
-        /* If the coordinator is multi-hop, send via the global IP of the root to route it through RPL */
-        simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send), &root_ip);
+        /* If the coordinator is multi-hop, send via the global IP of the root
+         * to route it through RPL */
+        simple_udp_sendto(&udp_conn, &report_to_send, sizeof(report_to_send),
+                          &root_ip);
       }
     }
   }
@@ -99,13 +105,13 @@ static void print_page_bitmap(void) {
   }
 }
 
+
+
 /* UDP receive callback for Sensor Node */
 void udp_rx_callback(struct simple_udp_connection *c,
-                     const uip_ipaddr_t *sender_addr,
-                     uint16_t sender_port,
-                     const uip_ipaddr_t *receiver_addr,
-                     uint16_t receiver_port, const uint8_t *data,
-                     uint16_t datalen) {
+                     const uip_ipaddr_t *sender_addr, uint16_t sender_port,
+                     const uip_ipaddr_t *receiver_addr, uint16_t receiver_port,
+                     const uint8_t *data, uint16_t datalen) {
   if (node_id == 1) {
     if (datalen >= sizeof(bitmap_report_t)) {
       const bitmap_report_t *report = (const bitmap_report_t *)data;
@@ -137,7 +143,7 @@ void udp_rx_callback(struct simple_udp_connection *c,
               LOG_INFO("Marked node ");
               LOG_INFO_6ADDR(sender_addr);
               LOG_INFO_(" as replied.\n");
-              
+
               /* Check if all session nodes have replied */
               uint8_t all_replied = 1;
               for (int i = 0; i < session_nodes_count; i++) {
@@ -147,7 +153,8 @@ void udp_rx_callback(struct simple_udp_connection *c,
                 }
               }
               if (all_replied) {
-                LOG_INFO("All expected nodes replied. Notifying distribution process.\n");
+                LOG_INFO("All expected nodes replied. Notifying distribution "
+                         "process.\n");
                 process_post(&distribute_process, event_bitmap_received, NULL);
               } else {
                 LOG_INFO("Still waiting for other nodes to reply.\n");
@@ -178,13 +185,16 @@ void udp_rx_callback(struct simple_udp_connection *c,
   int has_coord_ll = get_coordinator_ll_ip(&coordinator_ll_ip);
 
   /* Determine if this packet should be forwarded based on RPL parent.
-   * A node only forwards downward traffic originating from the root (coordinator)
-   * or its preferred parent, which naturally prevents routing loops and handles retransmissions.
-   * Additionally, leaf nodes (nodes with no downstream routes) do not need to forward. */
+   * A node only forwards downward traffic originating from the root
+   * (coordinator) or its preferred parent, which naturally prevents routing
+   * loops and handles retransmissions. Additionally, leaf nodes (nodes with no
+   * downstream routes) do not need to forward. */
   const uip_ipaddr_t *parent_ip = uip_ds6_defrt_choose();
-  uint8_t is_from_parent = (parent_ip != NULL && uip_ipaddr_cmp(sender_addr, parent_ip));
-  uint8_t is_from_coordinator = (has_coord_ll && uip_ipaddr_cmp(sender_addr, &coordinator_ll_ip));
-  
+  uint8_t is_from_parent =
+      (parent_ip != NULL && uip_ipaddr_cmp(sender_addr, parent_ip));
+  uint8_t is_from_coordinator =
+      (has_coord_ll && uip_ipaddr_cmp(sender_addr, &coordinator_ll_ip));
+
   /* Determine if we are a leaf node by checking the routing table.
    * Under RPL storing mode, a node is a leaf if it has no downstream routes. */
   uint8_t is_leaf = (uip_ds6_route_head() == NULL);
@@ -195,6 +205,7 @@ void udp_rx_callback(struct simple_udp_connection *c,
     LOG_INFO("[OTA] START received. File size: %lu\n",
              (unsigned long)pkt->offset);
     current_file_size = pkt->offset;
+    running_fw_crc = 0;
 
     /* Reset bitmap variables */
     current_rx_page_offset = 0xFFFFFFFF;
@@ -213,7 +224,8 @@ void udp_rx_callback(struct simple_udp_connection *c,
       LOG_INFO("[ERROR] Failed to open flash!\n");
     }
 
-    /* Forward START if from parent or coordinator (optimized for line topology) */
+    /* Forward START if from parent or coordinator (optimized for line topology)
+     */
     if (should_forward) {
       send_to_all(pkt, datalen);
     }
@@ -221,7 +233,8 @@ void udp_rx_callback(struct simple_udp_connection *c,
     /* Set a 5-second ctimer to switch to period 11. This allows the node
      * to finish the flash erase and fully resynchronize with the coordinator
      * on period 61 before transitioning to period 11. */
-    ctimer_set(&start_delay_ctimer, CLOCK_SECOND * 5, start_delay_callback, NULL);
+    ctimer_set(&start_delay_ctimer, CLOCK_SECOND * 5, start_delay_callback,
+               NULL);
   } else if (pkt->type == PKT_TYPE_DATA) {
     set_shared_period(11); /* Reset timeout timer and ensure fast period */
     LOG_INFO("[OTA] DATA received: offset 0x%05lx, len %u\n",
@@ -247,7 +260,8 @@ void udp_rx_callback(struct simple_udp_connection *c,
         }
       } else {
         if (ext_flash_open(NULL)) {
-          LOG_INFO("[OTA] Erasing sector for page 0x%05lx...\n", (unsigned long)page_offset);
+          LOG_INFO("[OTA] Erasing sector for page 0x%05lx...\n",
+                   (unsigned long)page_offset);
           ext_flash_erase(NULL, page_offset, EXT_FLASH_ERASE_SECTOR_SIZE);
           ext_flash_close(NULL);
         } else {
@@ -260,7 +274,8 @@ void udp_rx_callback(struct simple_udp_connection *c,
       memset(page_bitmap, 0, sizeof(page_bitmap));
 
       if (ext_flash_open(NULL)) {
-        LOG_INFO("[OTA] Transitioning to page 0x%05lx: Erasing sector...\n", (unsigned long)page_offset);
+        LOG_INFO("[OTA] Transitioning to page 0x%05lx: Erasing sector...\n",
+                 (unsigned long)page_offset);
         ext_flash_erase(NULL, page_offset, EXT_FLASH_ERASE_SECTOR_SIZE);
         ext_flash_close(NULL);
       } else {
@@ -268,12 +283,15 @@ void udp_rx_callback(struct simple_udp_connection *c,
       }
     } else if (page_offset < current_rx_page_offset) {
       /* Ignore data for an older page */
-      LOG_WARN("[OTA] Ignored DATA for older page: offset 0x%05lx (current page: 0x%05lx)\n",
-               (unsigned long)page_offset, (unsigned long)current_rx_page_offset);
+      LOG_WARN("[OTA] Ignored DATA for older page: offset 0x%05lx (current "
+               "page: 0x%05lx)\n",
+               (unsigned long)page_offset,
+               (unsigned long)current_rx_page_offset);
       return;
     }
 
-    /* Check if this chunk is already received to avoid duplicate write to flash */
+    /* Check if this chunk is already received to avoid duplicate write to flash
+     */
     uint8_t chunk_already_received = 0;
     uint16_t chunk_idx = (pkt->offset % EXT_FLASH_ERASE_SECTOR_SIZE) / 64;
     if (chunk_idx < 64) {
@@ -282,7 +300,8 @@ void udp_rx_callback(struct simple_udp_connection *c,
       }
     }
 
-    /* Forward the packet if from parent or coordinator (optimized for line topology) */
+    /* Forward the packet if from parent or coordinator (optimized for line
+     * topology) */
     if (should_forward) {
       send_to_all(pkt, datalen);
     }
@@ -301,21 +320,23 @@ void udp_rx_callback(struct simple_udp_connection *c,
       }
     }
   } else if (pkt->type == PKT_TYPE_PAGE_END) {
-    LOG_INFO("[OTA] PAGE_END received for offset 0x%05lx\n", (unsigned long)pkt->offset);
-    
+    LOG_INFO("[OTA] PAGE_END received for offset 0x%05lx\n",
+             (unsigned long)pkt->offset);
+
     /* Debug print routes */
     uip_ds6_route_t *r;
     LOG_INFO("[DEBUG] Routing table dump:\n");
     int route_cnt = 0;
-    for(r = uip_ds6_route_head(); r != NULL; r = uip_ds6_route_next(r)) {
+    for (r = uip_ds6_route_head(); r != NULL; r = uip_ds6_route_next(r)) {
       LOG_INFO("  - Route to: ");
       LOG_INFO_6ADDR(&r->ipaddr);
       LOG_INFO_("\n");
       route_cnt++;
     }
     LOG_INFO("[DEBUG] Total routes: %d\n", route_cnt);
-    
-    /* Forward PAGE_END if from parent or coordinator (optimized for line topology) */
+
+    /* Forward PAGE_END if from parent or coordinator (optimized for line
+     * topology) */
     if (should_forward) {
       send_to_all(pkt, datalen);
     }
@@ -325,28 +346,32 @@ void udp_rx_callback(struct simple_udp_connection *c,
     } else if (current_rx_page_offset == 0xFFFFFFFF && pkt->offset == 0) {
       current_rx_page_offset = 0;
       memset(page_bitmap, 0, sizeof(page_bitmap));
-    } else if (pkt->offset > current_rx_page_offset && current_rx_page_offset != 0xFFFFFFFF) {
+    } else if (pkt->offset > current_rx_page_offset &&
+               current_rx_page_offset != 0xFFFFFFFF) {
       current_rx_page_offset = pkt->offset;
       memset(page_bitmap, 0, sizeof(page_bitmap));
     } else {
       return;
     }
 
-    /* Verify CRC-16 of the received page */
+    /* Verify CRC-16 of the received page and update cumulative running CRC */
     uint16_t page_len = PAGE_SIZE;
     if (current_rx_page_offset + page_len > current_file_size) {
       page_len = current_file_size - current_rx_page_offset;
     }
 
     uint16_t page_crc = 0;
+    uint16_t temp_fw_crc = running_fw_crc;
     int flash_ok = 0;
     if (ext_flash_open(NULL)) {
       flash_ok = 1;
       uint8_t buf[64];
       for (uint32_t i = 0; i < page_len; i += sizeof(buf)) {
-        uint16_t chunk = (page_len - i > sizeof(buf)) ? sizeof(buf) : (page_len - i);
+        uint16_t chunk =
+            (page_len - i > sizeof(buf)) ? sizeof(buf) : (page_len - i);
         ext_flash_read(NULL, current_rx_page_offset + i, chunk, buf);
         page_crc = crc16_data(buf, chunk, page_crc);
+        temp_fw_crc = crc16_data(buf, chunk, temp_fw_crc);
       }
       ext_flash_close(NULL);
     }
@@ -354,8 +379,10 @@ void udp_rx_callback(struct simple_udp_connection *c,
     if (flash_ok && page_crc == pkt->length) {
       LOG_INFO("[OTA PAGE SUCCESS] CRC matches for page 0x%05lx (0x%04x)\n",
                (unsigned long)current_rx_page_offset, page_crc);
+      running_fw_crc = temp_fw_crc; /* Commit running CRC update */
     } else {
-      LOG_WARN("[OTA PAGE FAILED] CRC mismatch/Flash error for page 0x%05lx! Expected 0x%04x, got 0x%04x\n",
+      LOG_WARN("[OTA PAGE FAILED] CRC mismatch/Flash error for page 0x%05lx! "
+               "Expected 0x%04x, got 0x%04x\n",
                (unsigned long)current_rx_page_offset, pkt->length, page_crc);
       /* Clear page bitmap to trigger retransmission of all chunks in this page */
       memset(page_bitmap, 0, sizeof(page_bitmap));
@@ -376,24 +403,12 @@ void udp_rx_callback(struct simple_udp_connection *c,
     print_page_bitmap();
     current_rx_page_offset = 0xFFFFFFFF;
 
-    uint16_t checksum = 0;
-    if (ext_flash_open(NULL)) {
-      uint8_t buf[64];
-      for (uint32_t i = 0; i < current_file_size; i += sizeof(buf)) {
-        uint16_t chunk = (current_file_size - i > sizeof(buf))
-                             ? sizeof(buf)
-                             : (current_file_size - i);
-        ext_flash_read(NULL, i, chunk, buf);
-        checksum = crc16_data(buf, chunk, checksum);
-      }
-      ext_flash_close(NULL);
-    }
-    if (checksum == (uint16_t)pkt->offset) {
-      LOG_INFO("[OTA VERIFY SUCCESS] CRC matches! (0x%04x)\n",
-               checksum);
+    /* Verify final cumulative CRC in memory without blocking the CPU or reading flash */
+    if (running_fw_crc == (uint16_t)pkt->offset) {
+      LOG_INFO("[OTA VERIFY SUCCESS] Cumulative CRC matches! (0x%04x)\n", running_fw_crc);
     } else {
-      LOG_INFO("[OTA VERIFY FAILED] CRC mismatch! Expected 0x%04x, got 0x%04x\n",
-               (uint16_t)pkt->offset, checksum);
+      LOG_INFO("[OTA VERIFY FAILED] Cumulative CRC mismatch! Expected 0x%04x, got 0x%04x\n",
+               (uint16_t)pkt->offset, running_fw_crc);
     }
     set_shared_period(61);
     ota_sensor_node_reset_forwarding();

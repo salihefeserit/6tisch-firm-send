@@ -73,8 +73,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
              dist_chunk_idx + 1, total_chunks, (unsigned long)chunk_abs_offset,
              chunk_len);
 
-    /* Wait for 100 ms to avoid network congestion and queue overflows (optimized for line topology) */
-    etimer_set(&dist_timer, CLOCK_SECOND * 10 / 100);
+    /* Wait for 80 ms to avoid network congestion and queue overflows (optimized for line topology) */
+    etimer_set(&dist_timer, CLOCK_SECOND * 8 / 100);
     PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
   }
 
@@ -254,8 +254,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
           send_to_all(&pkt, 7 + chunk_len);
         }
 
-        /* Wait for 100 ms pacing delay between retransmissions (optimized for line topology) */
-        etimer_set(&dist_timer, CLOCK_SECOND * 10 / 100);
+        /* Wait for 80 ms pacing delay between retransmissions (optimized for line topology) */
+        etimer_set(&dist_timer, CLOCK_SECOND * 8 / 100);
         PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
       }
     }
