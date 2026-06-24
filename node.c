@@ -68,22 +68,13 @@ PROCESS_THREAD(node_process, ev, data) {
                          data);
           }
         }
-      } else if (ev == PROCESS_EVENT_TIMER && data == &ota_timeout_timer) {
-        LOG_INFO("[OTA] Timeout reached on coordinator, dropping back to low-power\n");
-        set_shared_period(61);
       }
     }
   }
 
-  /* Sensor-node: keep the process alive and handle timeout */
+  /* Sensor-node: keep the process alive */
   while (1) {
     PROCESS_WAIT_EVENT();
-    if (ev == PROCESS_EVENT_TIMER && data == &ota_timeout_timer) {
-      LOG_INFO(
-          "[OTA] Timeout reached on sensor-node, dropping back to low-power\n");
-      set_shared_period(61);
-      ota_sensor_node_reset_forwarding();
-    }
   }
 
   PROCESS_END();

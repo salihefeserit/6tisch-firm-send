@@ -123,15 +123,15 @@ PROCESS_THREAD(distribute_process, ev, data) {
     LOG_INFO("Sent PAGE_END for offset 0x%05lx, waiting for bitmap...\n",
              (unsigned long)page_start_offset);
 
-    /* Wait for bitmap reports (or timeout of 5.0 seconds) */
-    etimer_set(&dist_timer, CLOCK_SECOND * 5);
+    /* Wait for bitmap reports (or timeout of 15.0 seconds) */
+    etimer_set(&dist_timer, CLOCK_SECOND * 15);
     while (1) {
       PROCESS_WAIT_EVENT();
       if (ev == PROCESS_EVENT_TIMER && data == &dist_timer) {
         retry_count++;
         
         /* Print pending nodes */
-        LOG_INFO("Timeout (%d/5) waiting for reports. Pending nodes:\n", retry_count);
+        LOG_INFO("Timeout (%d/3) waiting for reports. Pending nodes:\n", retry_count);
         for (int i = 0; i < session_nodes_count; i++) {
           if (!node_replied[i]) {
             LOG_INFO("  - ");
@@ -140,7 +140,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
           }
         }
 
-        if (retry_count >= 5) {
+        if (retry_count >= 3) {
           /* Check if at least one node replied in this round */
           uint8_t replied_count = 0;
           for (int i = 0; i < session_nodes_count; i++) {
@@ -176,7 +176,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
         
         LOG_INFO("Sending PAGE_END again...\n");
         send_to_all(&end_pkt, 7);
-        etimer_set(&dist_timer, CLOCK_SECOND * 5);
+        etimer_set(&dist_timer, CLOCK_SECOND * 15);
       } else if (ev == event_bitmap_received) {
         /* Double check if all nodes have actually replied in this round to ignore stale events */
         uint8_t all_replied = 1;
@@ -202,18 +202,16 @@ PROCESS_THREAD(distribute_process, ev, data) {
       break;
     }
 
-    /* We have missing chunks! Iterate over chunks and count misses to decide unicast vs broadcast */
+    /* We have missing chunks! Iterate over chunks and count misses */
     LOG_INFO("Analyzing missing chunks for page 0x%05lx...\n", (unsigned long)page_start_offset);
     for (dist_chunk_idx = 0; dist_chunk_idx < total_chunks; dist_chunk_idx++) {
       uint8_t byte_idx = dist_chunk_idx / 8;
       uint8_t bit_idx = dist_chunk_idx % 8;
       uint8_t missed_count = 0;
-      int last_missed_node_idx = -1;
 
       for (int i = 0; i < session_nodes_count; i++) {
         if ((session_bitmaps[i][byte_idx] & (1 << bit_idx)) == 0) {
           missed_count++;
-          last_missed_node_idx = i;
         }
       }
 
@@ -230,29 +228,9 @@ PROCESS_THREAD(distribute_process, ev, data) {
         pkt.length = chunk_len;
         memcpy(pkt.data, &page_buffer[dist_chunk_idx * 64], chunk_len);
 
-        if (missed_count == 1) {
-          /* Exactly 1 node missed this chunk: Check if it is a 1-hop neighbor */
-          uip_ds6_route_t *r = uip_ds6_route_lookup(&session_nodes[last_missed_node_idx]);
-          const uip_ipaddr_t *nexthop = (r != NULL) ? uip_ds6_route_nexthop(r) : NULL;
-          uint8_t is_one_hop = (r != NULL && nexthop != NULL && uip_ipaddr_cmp(nexthop, &session_nodes[last_missed_node_idx]));
-
-          if (is_one_hop) {
-            LOG_INFO("Retransmitting chunk %u unicast to ", dist_chunk_idx);
-            LOG_INFO_6ADDR(&session_nodes[last_missed_node_idx]);
-            LOG_INFO_(" (offset 0x%05lx)\n", (unsigned long)chunk_abs_offset);
-            simple_udp_sendto(&udp_conn, &pkt, 7 + chunk_len, &session_nodes[last_missed_node_idx]);
-          } else {
-            LOG_INFO("Retransmitting chunk %u broadcast (multi-hop target: ", dist_chunk_idx);
-            LOG_INFO_6ADDR(&session_nodes[last_missed_node_idx]);
-            LOG_INFO_(", offset 0x%05lx)\n", (unsigned long)chunk_abs_offset);
-            send_to_all(&pkt, 7 + chunk_len);
-          }
-        } else {
-          /* 2 or more nodes missed this chunk: Send via Broadcast */
-          LOG_INFO("Retransmitting chunk %u broadcast (offset 0x%05lx, missed by %u nodes)\n",
-                   dist_chunk_idx, (unsigned long)chunk_abs_offset, missed_count);
-          send_to_all(&pkt, 7 + chunk_len);
-        }
+        LOG_INFO("Retransmitting chunk %u (offset 0x%05lx, missed by %u nodes)\n",
+                 dist_chunk_idx, (unsigned long)chunk_abs_offset, missed_count);
+        send_to_all(&pkt, 7 + chunk_len);
 
         /* Wait for 80 ms pacing delay between retransmissions (optimized for line topology) */
         etimer_set(&dist_timer, CLOCK_SECOND * 8 / 100);
@@ -339,8 +317,6 @@ void ota_coordinator_handle_uart(const char *str) {
     }
   } else if (str[3] == 'D') {
     if (sscanf(str, "FW:D:%lx:%x:%128s", &offset, &length, hexdata) >= 3) {
-      set_shared_period(11); /* Switch to fast period on data transmission */
-
       if (distribution_in_progress) {
         LOG_INFO("[ERROR] Page distribution in progress, ignoring UART chunk!\n");
       } else if (offset >= page_start_offset &&
@@ -384,8 +360,6 @@ void ota_coordinator_handle_uart(const char *str) {
 
       /* Acknowledge VERIFY command */
       printf("FW:ACK\n");
-
-      reset_ota_timer(); /* Let the timeout timer return us to normal 61 period */
 
       /* Restart the serial shell now that transmission is complete */
       if (!process_is_running(&serial_shell_process)) {

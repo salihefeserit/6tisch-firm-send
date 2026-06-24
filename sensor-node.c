@@ -18,13 +18,6 @@ static uint16_t running_fw_crc = 0;
 static struct ctimer report_ctimer;
 static bitmap_report_t report_to_send;
 
-static struct ctimer start_delay_ctimer;
-
-static void start_delay_callback(void *ptr) {
-  LOG_INFO("[OTA] Start delay complete, switching to period 11\n");
-  set_shared_period(11);
-}
-
 static int get_coordinator_ll_ip(uip_ipaddr_t *ip) {
   uip_ipaddr_t root_ip;
   if (NETSTACK_ROUTING.get_root_ipaddr != NULL &&
@@ -230,13 +223,8 @@ void udp_rx_callback(struct simple_udp_connection *c,
       send_to_all(pkt, datalen);
     }
 
-    /* Set a 5-second ctimer to switch to period 11. This allows the node
-     * to finish the flash erase and fully resynchronize with the coordinator
-     * on period 61 before transitioning to period 11. */
-    ctimer_set(&start_delay_ctimer, CLOCK_SECOND * 5, start_delay_callback,
-               NULL);
+
   } else if (pkt->type == PKT_TYPE_DATA) {
-    set_shared_period(11); /* Reset timeout timer and ensure fast period */
     LOG_INFO("[OTA] DATA received: offset 0x%05lx, len %u\n",
              (unsigned long)pkt->offset, pkt->length);
 
@@ -410,11 +398,5 @@ void udp_rx_callback(struct simple_udp_connection *c,
       LOG_INFO("[OTA VERIFY FAILED] Cumulative CRC mismatch! Expected 0x%04x, got 0x%04x\n",
                (uint16_t)pkt->offset, running_fw_crc);
     }
-    set_shared_period(61);
-    ota_sensor_node_reset_forwarding();
   }
-}
-
-void ota_sensor_node_reset_forwarding(void) {
-  /* No-op in unicast optimization since there is no queue/timer */
 }

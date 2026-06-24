@@ -49,8 +49,6 @@ extern uint16_t page_bytes_received;
 extern uint16_t expected_page_size;
 extern uint8_t distribution_in_progress;
 extern struct simple_udp_connection udp_conn;
-extern struct etimer ota_timeout_timer;
-extern uint8_t shared_period_is_fast;
 
 #define MAX_NODES 16
 extern uip_ipaddr_t session_nodes[MAX_NODES];
@@ -58,11 +56,7 @@ extern uint8_t session_nodes_count;
 extern uint8_t node_replied[MAX_NODES];
 extern uint8_t session_bitmaps[MAX_NODES][8];
 
-#define OTA_TIMEOUT_DURATION (60 * CLOCK_SECOND)
-
 /* Shared helper/control functions */
-void set_shared_period(uint16_t new_size);
-void reset_ota_timer(void);
 uint8_t hex2val(char c);
 void send_to_all(const fw_packet_t *pkt, uint16_t len);
 
@@ -81,7 +75,5 @@ void udp_rx_callback(struct simple_udp_connection *c,
                      const uip_ipaddr_t *receiver_addr,
                      uint16_t receiver_port, const uint8_t *data,
                      uint16_t datalen);
-
-void ota_sensor_node_reset_forwarding(void);
 
 #endif /* OTA_H_ */
