@@ -5,3 +5,7 @@ sensor-node.bin
 coordinator.log
 sensor-node1.log
 sensor-node2.log
+serial_logger.py
+test_100k.bin
+test_crc
+test_crc.c

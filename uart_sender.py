@@ -107,7 +107,7 @@ def send_firmware(port, filename):
 
     # Send DATA chunks in pages
     page_size = 4096
-    chunk_size = 64
+    chunk_size = 32
     
     for page_offset in range(0, file_size, page_size):
         current_page_size = min(page_size, file_size - page_offset)

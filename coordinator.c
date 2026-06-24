@@ -48,6 +48,13 @@ PROCESS_THREAD(distribute_process, ev, data) {
   PROCESS_BEGIN();
 
   total_chunks = (expected_page_size + 63) / 64;
+  LOG_INFO("DEBUG crc16_add('1', 0) = 0x%04x\n", crc16_add('1', 0));
+  LOG_INFO("DEBUG crc16_add(0xef, 0) = 0x%04x\n", crc16_add(0xef, 0));
+  LOG_INFO("Page Buffer Header: ");
+  for(int i = 0; i < 16 && i < expected_page_size; i++) {
+    printf("%02x", page_buffer[i]);
+  }
+  printf("\n");
   page_crc = crc16_data(page_buffer, expected_page_size, 0);
   LOG_INFO("Distributing page at offset 0x%05lx, total chunks: %u, CRC-16: 0x%04x\n",
            (unsigned long)page_start_offset, total_chunks, page_crc);
@@ -323,6 +330,11 @@ void ota_coordinator_handle_uart(const char *str) {
                  offset < page_start_offset + expected_page_size) {
         uint32_t rel_offset = offset - page_start_offset;
         if (rel_offset + length <= expected_page_size) {
+          if (strlen(hexdata) != length * 2) {
+            LOG_WARN("[ERROR] Hex data length mismatch! Expected %u, got %u\n",
+                     length * 2, (unsigned int)strlen(hexdata));
+            return;
+          }
           for (int i = 0; i < length; i++) {
             page_buffer[rel_offset + i] =
                 (hex2val(hexdata[i * 2]) << 4) |
