@@ -125,6 +125,9 @@
 /* Enable sender-based Orchestra unicast slotframe to prevent queue build-up to non-routing neighbors */
 #define ORCHESTRA_CONF_UNICAST_SENDER_BASED 1
 
+/* Short unicast period to speed up linear topology updates */
+#define ORCHESTRA_CONF_UNICAST_PERIOD 7
+
 /* Orchestra Rules: switch to storing mode unicast rule */
 #undef ORCHESTRA_CONF_RULES
 #define ORCHESTRA_CONF_RULES { &eb_per_time_source, &unicast_per_neighbor_rpl_storing, &default_common }

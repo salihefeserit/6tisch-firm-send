@@ -12,6 +12,7 @@
 #include "services/orchestra/orchestra.h"
 #include "services/simple-energest/simple-energest.h"
 #include "ext-flash.h"
+#include "lib/crc16.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,7 +64,7 @@ extern uint8_t session_bitmaps[MAX_NODES][8];
 void set_shared_period(uint16_t new_size);
 void reset_ota_timer(void);
 uint8_t hex2val(char c);
-void send_to_all(fw_packet_t *pkt, uint16_t len);
+void send_to_all(const fw_packet_t *pkt, uint16_t len);
 
 /* Processes declared globally */
 PROCESS_NAME(distribute_process);

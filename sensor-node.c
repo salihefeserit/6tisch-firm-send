@@ -22,58 +22,7 @@ static void start_delay_callback(void *ptr) {
   set_shared_period(11);
 }
 
-/* Forwarding queue for controlled flooding */
-#define FW_QUEUE_SIZE 8
 
-typedef struct {
-  fw_packet_t pkt;
-  uint16_t len;
-} fw_queue_entry_t;
-
-static fw_queue_entry_t fw_queue[FW_QUEUE_SIZE];
-static uint8_t fw_queue_head = 0;
-static uint8_t fw_queue_tail = 0;
-static uint8_t fw_queue_count = 0;
-
-static struct ctimer forward_ctimer;
-
-static void do_forward(void *ptr) {
-  if (fw_queue_count == 0) {
-    return;
-  }
-  
-  fw_queue_entry_t *entry = &fw_queue[fw_queue_head];
-  
-  LOG_INFO("[OTA] Forwarding packet: type %u, offset 0x%05lx, len %u (queue: %u)\n",
-           entry->pkt.type, (unsigned long)entry->pkt.offset, entry->pkt.length, fw_queue_count);
-  send_to_all(&entry->pkt, entry->len);
-  
-  fw_queue_head = (fw_queue_head + 1) % FW_QUEUE_SIZE;
-  fw_queue_count--;
-  
-  if (fw_queue_count > 0) {
-    clock_time_t delay = (random_rand() % 50 + 100) * CLOCK_SECOND / 1000;
-    ctimer_set(&forward_ctimer, delay, do_forward, NULL);
-  }
-}
-
-static void schedule_forward(const fw_packet_t *pkt, uint16_t len) {
-  if (fw_queue_count >= FW_QUEUE_SIZE) {
-    LOG_WARN("[OTA] Forwarding queue full! Dropping packet (type %u, offset 0x%05lx)\n",
-             pkt->type, (unsigned long)pkt->offset);
-    return;
-  }
-  
-  memcpy(&fw_queue[fw_queue_tail].pkt, pkt, len);
-  fw_queue[fw_queue_tail].len = len;
-  fw_queue_tail = (fw_queue_tail + 1) % FW_QUEUE_SIZE;
-  fw_queue_count++;
-  
-  if (fw_queue_count == 1) {
-    clock_time_t delay = (random_rand() % 50 + 100) * CLOCK_SECOND / 1000;
-    ctimer_set(&forward_ctimer, delay, do_forward, NULL);
-  }
-}
 
 static int get_coordinator_ll_ip(uip_ipaddr_t *ip) {
   uip_ipaddr_t root_ip;
@@ -236,18 +185,9 @@ void udp_rx_callback(struct simple_udp_connection *c,
   uint8_t is_from_parent = (parent_ip != NULL && uip_ipaddr_cmp(sender_addr, parent_ip));
   uint8_t is_from_coordinator = (has_coord_ll && uip_ipaddr_cmp(sender_addr, &coordinator_ll_ip));
   
-  /* Determine if we are a leaf node by checking the neighbor cache.
-   * If all our neighbors are either the coordinator or our parent, then we are a leaf node. */
-  uint8_t is_leaf = 1;
-  uip_ds6_nbr_t *nbr;
-  for(nbr = uip_ds6_nbr_head(); nbr != NULL; nbr = uip_ds6_nbr_next(nbr)) {
-    int is_coord = (has_coord_ll && uip_ipaddr_cmp(&nbr->ipaddr, &coordinator_ll_ip));
-    int is_parent = (parent_ip != NULL && uip_ipaddr_cmp(&nbr->ipaddr, parent_ip));
-    if(!is_coord && !is_parent) {
-      is_leaf = 0;
-      break;
-    }
-  }
+  /* Determine if we are a leaf node by checking the routing table.
+   * Under RPL storing mode, a node is a leaf if it has no downstream routes. */
+  uint8_t is_leaf = (uip_ds6_route_head() == NULL);
 
   uint8_t should_forward = (is_from_parent || is_from_coordinator) && !is_leaf;
 
@@ -273,9 +213,9 @@ void udp_rx_callback(struct simple_udp_connection *c,
       LOG_INFO("[ERROR] Failed to open flash!\n");
     }
 
-    /* Controlled flooding: Forward START if from parent or coordinator */
+    /* Forward START if from parent or coordinator (optimized for line topology) */
     if (should_forward) {
-      schedule_forward(pkt, datalen);
+      send_to_all(pkt, datalen);
     }
 
     /* Set a 5-second ctimer to switch to period 11. This allows the node
@@ -342,9 +282,9 @@ void udp_rx_callback(struct simple_udp_connection *c,
       }
     }
 
-    /* Controlled flooding: Forward the packet if from parent or coordinator */
+    /* Forward the packet if from parent or coordinator (optimized for line topology) */
     if (should_forward) {
-      schedule_forward(pkt, datalen);
+      send_to_all(pkt, datalen);
     }
 
     /* Process the data packet only if it is a new chunk */
@@ -375,37 +315,68 @@ void udp_rx_callback(struct simple_udp_connection *c,
     }
     LOG_INFO("[DEBUG] Total routes: %d\n", route_cnt);
     
-    /* Controlled flooding: Forward PAGE_END if from parent or coordinator */
+    /* Forward PAGE_END if from parent or coordinator (optimized for line topology) */
     if (should_forward) {
-      schedule_forward(pkt, datalen);
+      send_to_all(pkt, datalen);
     }
 
     if (pkt->offset == current_rx_page_offset) {
-      /* Print and send the report */
-      print_page_bitmap();
+      /* Proceed directly */
     } else if (current_rx_page_offset == 0xFFFFFFFF && pkt->offset == 0) {
       current_rx_page_offset = 0;
       memset(page_bitmap, 0, sizeof(page_bitmap));
-      print_page_bitmap();
     } else if (pkt->offset > current_rx_page_offset && current_rx_page_offset != 0xFFFFFFFF) {
       current_rx_page_offset = pkt->offset;
       memset(page_bitmap, 0, sizeof(page_bitmap));
-      print_page_bitmap();
+    } else {
+      return;
     }
-  } else if (pkt->type == PKT_TYPE_VERIFY) {
-    LOG_INFO("[OTA] VERIFY request received! Expected CRC: 0x%08lx\n",
-             (unsigned long)pkt->offset);
 
-    /* Controlled flooding: Forward VERIFY if from parent or coordinator */
+    /* Verify CRC-16 of the received page */
+    uint16_t page_len = PAGE_SIZE;
+    if (current_rx_page_offset + page_len > current_file_size) {
+      page_len = current_file_size - current_rx_page_offset;
+    }
+
+    uint16_t page_crc = 0;
+    int flash_ok = 0;
+    if (ext_flash_open(NULL)) {
+      flash_ok = 1;
+      uint8_t buf[64];
+      for (uint32_t i = 0; i < page_len; i += sizeof(buf)) {
+        uint16_t chunk = (page_len - i > sizeof(buf)) ? sizeof(buf) : (page_len - i);
+        ext_flash_read(NULL, current_rx_page_offset + i, chunk, buf);
+        page_crc = crc16_data(buf, chunk, page_crc);
+      }
+      ext_flash_close(NULL);
+    }
+
+    if (flash_ok && page_crc == pkt->length) {
+      LOG_INFO("[OTA PAGE SUCCESS] CRC matches for page 0x%05lx (0x%04x)\n",
+               (unsigned long)current_rx_page_offset, page_crc);
+    } else {
+      LOG_WARN("[OTA PAGE FAILED] CRC mismatch/Flash error for page 0x%05lx! Expected 0x%04x, got 0x%04x\n",
+               (unsigned long)current_rx_page_offset, pkt->length, page_crc);
+      /* Clear page bitmap to trigger retransmission of all chunks in this page */
+      memset(page_bitmap, 0, sizeof(page_bitmap));
+    }
+
+    /* Print and send the report */
+    print_page_bitmap();
+  } else if (pkt->type == PKT_TYPE_VERIFY) {
+    LOG_INFO("[OTA] VERIFY request received! Expected CRC: 0x%04x\n",
+             (uint16_t)pkt->offset);
+
+    /* Forward VERIFY if from parent or coordinator (optimized for line topology) */
     if (should_forward) {
-      schedule_forward(pkt, datalen);
+      send_to_all(pkt, datalen);
     }
 
     /* Print final page bitmap (if not already printed by PAGE_END) */
     print_page_bitmap();
     current_rx_page_offset = 0xFFFFFFFF;
 
-    uint32_t checksum = 0;
+    uint16_t checksum = 0;
     if (ext_flash_open(NULL)) {
       uint8_t buf[64];
       for (uint32_t i = 0; i < current_file_size; i += sizeof(buf)) {
@@ -413,19 +384,16 @@ void udp_rx_callback(struct simple_udp_connection *c,
                              ? sizeof(buf)
                              : (current_file_size - i);
         ext_flash_read(NULL, i, chunk, buf);
-        for (int j = 0; j < chunk; j++) {
-          checksum += buf[j];
-        }
+        checksum = crc16_data(buf, chunk, checksum);
       }
       ext_flash_close(NULL);
     }
-    checksum &= 0xFFFFFFFF;
-    if (checksum == pkt->offset) {
-      LOG_INFO("[OTA VERIFY SUCCESS] Checksum matches! (0x%08lx)\n",
-               (unsigned long)checksum);
+    if (checksum == (uint16_t)pkt->offset) {
+      LOG_INFO("[OTA VERIFY SUCCESS] CRC matches! (0x%04x)\n",
+               checksum);
     } else {
-      LOG_INFO("[OTA VERIFY FAILED] Checksum mismatch! Expected 0x%08lx, got 0x%08lx\n",
-               (unsigned long)pkt->offset, (unsigned long)checksum);
+      LOG_INFO("[OTA VERIFY FAILED] CRC mismatch! Expected 0x%04x, got 0x%04x\n",
+               (uint16_t)pkt->offset, checksum);
     }
     set_shared_period(61);
     ota_sensor_node_reset_forwarding();
@@ -433,9 +401,5 @@ void udp_rx_callback(struct simple_udp_connection *c,
 }
 
 void ota_sensor_node_reset_forwarding(void) {
-  ctimer_stop(&forward_ctimer);
-  fw_queue_head = 0;
-  fw_queue_tail = 0;
-  fw_queue_count = 0;
-  LOG_INFO("[OTA] Reset sensor node forwarding queue\n");
+  /* No-op in unicast optimization since there is no queue/timer */
 }

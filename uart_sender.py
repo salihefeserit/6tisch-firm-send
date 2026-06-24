@@ -3,6 +3,20 @@ import time
 import sys
 import os
 
+def crc16_add(b: int, acc: int) -> int:
+    acc ^= b
+    acc &= 0xFFFF
+    acc = ((acc >> 8) | (acc << 8)) & 0xFFFF
+    acc ^= ((acc & 0xFF00) << 4) & 0xFFFF
+    acc ^= ((acc >> 8) >> 4) & 0xFFFF
+    acc ^= ((acc & 0xFF00) >> 5) & 0xFFFF
+    return acc
+
+def crc16_data(data: bytes, acc: int = 0) -> int:
+    for b in data:
+        acc = crc16_add(b, acc)
+    return acc
+
 def send_command_with_ack(ser, cmd, expected_ack="FW:ACK", timeout=0.5):
     """
     Sends a command to the serial port and waits for the expected acknowledgement.
@@ -72,8 +86,8 @@ def send_firmware(port, filename):
     file_size = len(data)
     print(f"File size: {file_size} bytes")
     
-    # Calculate simple checksum (sum of bytes)
-    checksum = sum(data) & 0xFFFFFFFF
+    # Calculate CRC-16 CCITT (matching Contiki-NG crc16_data)
+    checksum = crc16_data(data, 0)
     
     # Clear the log file at the start of the session
     with open("coordinator.log", "w", encoding="utf-8") as f_log:

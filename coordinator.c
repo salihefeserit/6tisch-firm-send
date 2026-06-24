@@ -43,12 +43,14 @@ PROCESS_THREAD(distribute_process, ev, data) {
   static uint16_t total_chunks;
   static fw_packet_t end_pkt;
   static uint8_t recovery_round;
+  static uint16_t page_crc;
 
   PROCESS_BEGIN();
 
   total_chunks = (expected_page_size + 63) / 64;
-  LOG_INFO("Distributing page at offset 0x%05lx, total chunks: %u\n",
-           (unsigned long)page_start_offset, total_chunks);
+  page_crc = crc16_data(page_buffer, expected_page_size, 0);
+  LOG_INFO("Distributing page at offset 0x%05lx, total chunks: %u, CRC-16: 0x%04x\n",
+           (unsigned long)page_start_offset, total_chunks, page_crc);
 
   /* Reset session bitmaps to 0 for the new page */
   memset(session_bitmaps, 0, sizeof(session_bitmaps));
@@ -71,8 +73,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
              dist_chunk_idx + 1, total_chunks, (unsigned long)chunk_abs_offset,
              chunk_len);
 
-    /* Wait for 500 ms to avoid network congestion and queue overflows */
-    etimer_set(&dist_timer, CLOCK_SECOND * 50 / 100);
+    /* Wait for 100 ms to avoid network congestion and queue overflows (optimized for line topology) */
+    etimer_set(&dist_timer, CLOCK_SECOND * 10 / 100);
     PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
   }
 
@@ -116,7 +118,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
     /* Broadcast PAGE_END packet to prompt reports */
     end_pkt.type = PKT_TYPE_PAGE_END;
     end_pkt.offset = page_start_offset;
-    end_pkt.length = 0;
+    end_pkt.length = page_crc;
     send_to_all(&end_pkt, 7);
     LOG_INFO("Sent PAGE_END for offset 0x%05lx, waiting for bitmap...\n",
              (unsigned long)page_start_offset);
@@ -252,8 +254,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
           send_to_all(&pkt, 7 + chunk_len);
         }
 
-        /* Wait for 500 ms pacing delay between retransmissions */
-        etimer_set(&dist_timer, CLOCK_SECOND * 50 / 100);
+        /* Wait for 100 ms pacing delay between retransmissions (optimized for line topology) */
+        etimer_set(&dist_timer, CLOCK_SECOND * 10 / 100);
         PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
       }
     }
