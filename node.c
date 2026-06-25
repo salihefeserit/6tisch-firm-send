@@ -23,6 +23,7 @@ PROCESS_THREAD(node_process, ev, data) {
   /* Simple Energest Monitoring */
   simple_energest_init();
 
+
   if (node_id == 1) {
     LOG_INFO("This device is COORDINATOR (node_id=1).\n");
     tsch_set_coordinator(1);
@@ -42,8 +43,11 @@ PROCESS_THREAD(node_process, ev, data) {
   if (node_id == 1) {
     LOG_INFO("Waiting for TSCH association and first sensor-node route...\n");
 
+    static struct etimer route_timer;
+    etimer_set(&route_timer, CLOCK_SECOND);
     while (!ota_coordinator_has_routes()) {
-      PROCESS_PAUSE();
+      PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &route_timer);
+      etimer_reset(&route_timer);
     }
 
     LOG_INFO("Routes detected. Ready to receive firmware via UART.\n");
