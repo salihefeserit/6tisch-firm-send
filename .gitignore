@@ -2,6 +2,21 @@
 build/
 coordinator.bin
 sensor-node.bin
+coordinator.elf
+coordinator.hex
+coordinator-slot*.bin
+coordinator-slot*.elf
+coordinator-slot*.hex
+sensor-node-slot*.bin
+sensor-node-slot*.elf
+sensor-node-slot*.hex
+sensor-node.hex
+coordinator-offchip*.bin
+coordinator-offchip*.elf
+coordinator-offchip*.hex
+sensor-node-offchip*.bin
+sensor-node-offchip*.elf
+sensor-node-offchip*.hex
 coordinator.log
 sensor-node1.log
 sensor-node2.log
@@ -9,3 +24,5 @@ serial_logger.py
 test_100k.bin
 test_crc
 test_crc.c
+sign.bin
+__pycache__/

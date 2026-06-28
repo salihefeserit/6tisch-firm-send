@@ -11,8 +11,19 @@
 #include "net/routing/routing.h"
 #include "services/orchestra/orchestra.h"
 #include "services/simple-energest/simple-energest.h"
+
+#ifndef OTA_WITH_BIM_DUAL_ONCHIP
+#define OTA_WITH_BIM_DUAL_ONCHIP 0
+#endif
+#ifndef OTA_WITH_BIM_OFFCHIP
+#define OTA_WITH_BIM_OFFCHIP 0
+#endif
+#if OTA_WITH_BIM_OFFCHIP
 #include "ext-flash.h"
+#endif
+
 #include "lib/crc16.h"
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,21 +36,70 @@
 #define PKT_TYPE_VERIFY 2
 #define PKT_TYPE_BITMAP_REPORT 3
 #define PKT_TYPE_PAGE_END 4
+#define PKT_TYPE_START_REPORT 5
+
+#define OTA_REPORT_STATUS_OK 0
+#define OTA_REPORT_STATUS_REJECTED_SAME_SLOT 1
 
 #define PAGE_SIZE 4096
+
+#ifndef OTA_SLOT_A
+#define OTA_SLOT_A 0
+#endif
+#ifndef OTA_SLOT_B
+#define OTA_SLOT_B 1
+#endif
+#define OTA_SLOT_INVALID 0xff
+
+#define OTA_SLOT_A_START 0x00000000UL
+#define OTA_SLOT_A_SIZE 0x0002A000UL
+#define OTA_FLASH_METADATA_START 0x0002A000UL
+#define OTA_SLOT_B_START 0x0002E000UL
+#define OTA_SLOT_B_SIZE 0x00028000UL
+#define OTA_BIM_START 0x00056000UL
+#define OTA_FLASH_END 0x00058000UL
+#define OTA_FLASH_ERASE_SECTOR_SIZE 0x2000UL
+
+#define OTA_EXT_METADATA_ADDR 0x00000UL
+#define OTA_EXT_IMAGE_ADDR 0x10000UL
+
+#define OTA_INTERNAL_IMAGE_START_ADDR 0x00000000UL
+#define OTA_INTERNAL_VECTOR_MIN_ADDR 0x000000A8UL
+#define OTA_INTERNAL_BIM_ADDR 0x00056000UL
+
+#define OTA_TARGET_OFFCHIP 0
+#define OTA_TARGET_INVALID 0xff
+
+#define OTA_START_SEC_VER_UNKNOWN 0
+
+#define OTA_START_STATUS_ACCEPTED 0
+#define OTA_START_STATUS_REJECTED_VERSION 1
+#define OTA_START_STATUS_REJECTED_TARGET 2
 
 typedef struct __attribute__((packed)) {
   uint8_t type;
   uint32_t offset;
   uint16_t length;
+  uint8_t target_slot;
   uint8_t data[64];
 } fw_packet_t;
 
+#define FW_PACKET_HEADER_LEN offsetof(fw_packet_t, data)
+
 typedef struct __attribute__((packed)) {
   uint8_t type; /* PKT_TYPE_BITMAP_REPORT */
+  uint8_t status;
   uint32_t page_offset;
   uint8_t bitmap[8];
 } bitmap_report_t;
+
+typedef struct __attribute__((packed)) {
+  uint8_t type; /* PKT_TYPE_START_REPORT */
+  uint8_t status;
+  uint16_t image_sec_ver;
+  uint16_t running_sec_ver;
+  uint8_t target_slot;
+} start_report_t;
 
 /* Global variables shared between modules */
 extern uint32_t current_file_size;
@@ -48,6 +108,7 @@ extern uint32_t page_start_offset;
 extern uint16_t page_bytes_received;
 extern uint16_t expected_page_size;
 extern uint8_t distribution_in_progress;
+extern uint8_t ota_target_slot;
 extern struct simple_udp_connection udp_conn;
 
 #define MAX_NODES 16
@@ -66,7 +127,13 @@ extern process_event_t event_bitmap_received;
 
 /* Coordinator-specific forward declarations */
 int ota_coordinator_has_routes(void);
+int find_session_node_by_addr(const uip_ipaddr_t *addr);
+void remove_session_node(int index);
 void ota_coordinator_handle_uart(const char *str);
+void ota_coordinator_handle_start_report(const start_report_t *report,
+                                         const uip_ipaddr_t *sender_addr);
+void ota_sensor_boot_check(void);
+void ota_sensor_confirm_stable(void);
 
 /* Sensor-node UDP callback */
 void udp_rx_callback(struct simple_udp_connection *c,

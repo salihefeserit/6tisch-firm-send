@@ -3,6 +3,23 @@ import time
 import sys
 import os
 
+OTA_SLOT_A = 0
+OTA_SLOT_B = 1
+
+def parse_slot(slot_text):
+    slot = slot_text.strip().lower()
+    if slot in ("0", "a", "slot-a", "slota"):
+        return OTA_SLOT_A
+    if slot in ("1", "b", "slot-b", "slotb"):
+        return OTA_SLOT_B
+    raise ValueError("slot must be 0/A or 1/B")
+
+def detect_target_slot(data: bytes):
+    header = data[:256]
+    if (0x0002E000).to_bytes(4, "little") in header or (0x0002E100).to_bytes(4, "little") in header:
+        return OTA_SLOT_B
+    return None
+
 def crc16_add(b: int, acc: int) -> int:
     acc ^= b
     acc &= 0xFFFF
@@ -50,6 +67,24 @@ def send_command_with_ack(ser, cmd, expected_ack="FW:ACK", timeout=0.5):
         time.sleep(0.1) # Small delay before retry
     return False
 
+def send_start_and_wait(ser, cmd, timeout=15.0):
+    """
+    Sends START once and waits for the coordinator admission result.
+    DATA transfer must not begin until FW:ACK is received.
+    """
+    ser.write(cmd.encode())
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        line = ser.readline().decode('utf-8', errors='ignore').strip()
+        if line:
+            with open("coordinator.log", "a", encoding="utf-8") as f_log:
+                f_log.write(line + "\n")
+            if line == "FW:ACK":
+                return "ACK"
+            if line == "FW:NO_TARGETS":
+                return "NO_TARGETS"
+    return "TIMEOUT"
+
 def handle_error_and_listen(ser, error_msg):
     print(f"\n{error_msg}")
     print("Entering passive listening mode to monitor logs. Press Ctrl+C to exit.")
@@ -68,7 +103,20 @@ def handle_error_and_listen(ser, error_msg):
         ser.close()
         sys.exit(1)
 
-def send_firmware(port, filename):
+def parse_image_sec_ver(value):
+    try:
+        sec_ver = int(value, 0)
+    except ValueError:
+        print(f"Error: Invalid image_sec_ver '{value}'. Use decimal or 0x-prefixed hex.")
+        sys.exit(1)
+
+    if sec_ver <= 0 or sec_ver > 0xFFFF:
+        print("Error: image_sec_ver must be in range 1..65535.")
+        sys.exit(1)
+
+    return sec_ver
+
+def send_firmware(port, filename, image_sec_ver=None, target_slot=None):
     if not os.path.exists(filename):
         print(f"Error: File {filename} not found.")
         sys.exit(1)
@@ -93,11 +141,31 @@ def send_firmware(port, filename):
     with open("coordinator.log", "w", encoding="utf-8") as f_log:
         f_log.write(f"=== New OTA Session: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
-    # Send START
-    print("Sending START...")
-    cmd = f"FW:S:{file_size:08X}\n"
-    if not send_command_with_ack(ser, cmd, "FW:ACK", timeout=1.5):
-        handle_error_and_listen(ser, "Error: Coordinator did not ACK START command.")
+    target_text = (target_slot or "offchip").strip().lower()
+    if target_text == "offchip":
+        if image_sec_ver is None:
+            print("Error: offchip target requires <image_sec_ver>.")
+            ser.close()
+            sys.exit(1)
+        print(f"Sending START (secVer={image_sec_ver}, target=offchip)...")
+        cmd = f"FW:S:{file_size:08X}:{image_sec_ver}:offchip\n"
+    else:
+        try:
+            target_slot_id = parse_slot(target_text)
+        except ValueError as e:
+            print(f"Error: {e}")
+            ser.close()
+            sys.exit(1)
+        print(f"Sending START (target slot={'A' if target_slot_id == OTA_SLOT_A else 'B'})...")
+        cmd = f"FW:S:{file_size:08X}:{target_slot_id}\n"
+
+    start_status = send_start_and_wait(ser, cmd, timeout=15.0)
+    if start_status == "NO_TARGETS":
+        print("Coordinator reported FW:NO_TARGETS. No eligible sensor nodes accepted this image.")
+        ser.close()
+        return
+    if start_status != "ACK":
+        handle_error_and_listen(ser, "Error: Coordinator did not complete START admission.")
     print("START ACK received.")
 
     # Wait for sensor nodes to complete flash erase and resynchronize on period 61,
@@ -153,6 +221,27 @@ def send_firmware(port, filename):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python uart_sender.py <serial_port> <firmware.bin>")
+        print("Usage: python uart_sender.py <serial_port> <firmware.bin> [image_sec_ver] [target]")
+        print("Example: python uart_sender.py /dev/tty.usbmodem00000001 sensor-node-offchip.bin 2 offchip")
+        print("Example: python uart_sender.py /dev/tty.usbmodem00000001 sensor-node-slot-b.bin B")
         sys.exit(1)
-    send_firmware(sys.argv[1], sys.argv[2])
+    image_sec_ver = None
+    target = None
+    if len(sys.argv) >= 4:
+        arg3 = sys.argv[3]
+        if arg3.strip().lower() in ("0", "1", "a", "b", "slot-a", "slot-b", "slota", "slotb"):
+            target = arg3
+        else:
+            image_sec_ver = parse_image_sec_ver(arg3)
+    if len(sys.argv) >= 5:
+        target = sys.argv[4]
+    if target is None and image_sec_ver is not None:
+        target = "offchip"
+    if target is None:
+        with open(sys.argv[2], "rb") as f:
+            detected = detect_target_slot(f.read())
+        if detected is None:
+            print("Error: target missing. Use offchip with image_sec_ver, or slot A/B for dual-onchip.")
+            sys.exit(1)
+        target = "B" if detected == OTA_SLOT_B else "A"
+    send_firmware(sys.argv[1], sys.argv[2], image_sec_ver, target)

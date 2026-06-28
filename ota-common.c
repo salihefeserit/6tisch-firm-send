@@ -11,6 +11,7 @@ uint32_t page_start_offset = 0;
 uint16_t page_bytes_received = 0;
 uint16_t expected_page_size = 0;
 uint8_t distribution_in_progress = 0;
+uint8_t ota_target_slot = OTA_SLOT_INVALID;
 struct simple_udp_connection udp_conn;
 
 /* Fast hex char to byte converter */
