@@ -5,181 +5,8 @@
 #include "net/ipv6/uip-ds6.h"
 #include "ota.h"
 
-uip_ipaddr_t session_nodes[MAX_NODES];
-uint8_t session_nodes_count = 0;
-uint8_t node_replied[MAX_NODES];
-uint8_t session_bitmaps[MAX_NODES][8];
-uint8_t retry_count = 0;
-
-#define START_ADMISSION_TIMEOUT (CLOCK_SECOND * 8)
-
-static struct ctimer start_admission_timer;
-static uint8_t start_admission_in_progress = 0;
-static uint8_t session_start_accepted[MAX_NODES];
-
-process_event_t event_bitmap_received;
-
 PROCESS(distribute_process, "OTA Distribution Process");
 
-int ota_coordinator_has_routes(void) {
-  return tsch_is_associated && (uip_ds6_route_head() != NULL);
-}
-
-static uint8_t parse_ota_target(const char *target) {
-  if (target == NULL || target[0] == '\0' || strcmp(target, "0") == 0 ||
-      strcmp(target, "offchip") == 0 || strcmp(target, "OFFCHIP") == 0 ||
-      strcmp(target, "A") == 0 || strcmp(target, "a") == 0 ||
-      strcmp(target, "B") == 0 || strcmp(target, "b") == 0 ||
-      strcmp(target, "1") == 0) {
-    return OTA_TARGET_OFFCHIP;
-  }
-
-  return OTA_TARGET_INVALID;
-}
-
-static void populate_session_nodes_from_routes(void) {
-  session_nodes_count = 0;
-  uip_ds6_route_t *route;
-  for(route = uip_ds6_route_head(); route != NULL;
-      route = uip_ds6_route_next(route)) {
-    if(session_nodes_count < MAX_NODES) {
-      uip_ipaddr_copy(&session_nodes[session_nodes_count], &route->ipaddr);
-      session_nodes_count++;
-    } else {
-      LOG_WARN("Too many routing entries! Truncating to MAX_NODES (%d)\n",
-               MAX_NODES);
-      break;
-    }
-  }
-}
-
-static int find_session_node(const uip_ipaddr_t *addr) {
-  for (int i = 0; i < session_nodes_count; i++) {
-    if (memcmp(&session_nodes[i].u8[8], &addr->u8[8], 8) == 0) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-static void finish_start_admission(void *ptr) {
-  int write_idx = 0;
-  uint8_t accepted_count = 0;
-  uint8_t rejected_count = 0;
-  uint8_t silent_count = 0;
-
-  start_admission_in_progress = 0;
-
-  for (int i = 0; i < session_nodes_count; i++) {
-    if (node_replied[i] && session_start_accepted[i]) {
-      if (write_idx != i) {
-        uip_ipaddr_copy(&session_nodes[write_idx], &session_nodes[i]);
-        memcpy(session_bitmaps[write_idx], session_bitmaps[i],
-               sizeof(session_bitmaps[write_idx]));
-      }
-      write_idx++;
-      accepted_count++;
-    } else {
-      if (node_replied[i]) {
-        rejected_count++;
-        LOG_INFO("START admission dropped rejected node: ");
-      } else {
-        silent_count++;
-        LOG_INFO("START admission dropped silent node: ");
-      }
-      LOG_INFO_6ADDR(&session_nodes[i]);
-      LOG_INFO_("\n");
-    }
-  }
-
-  session_nodes_count = write_idx;
-
-  LOG_INFO("START admission complete: accepted=%u rejected=%u silent=%u\n",
-           accepted_count, rejected_count, silent_count);
-
-  if (session_nodes_count == 0) {
-    current_file_size = 0;
-    page_start_offset = 0;
-    page_bytes_received = 0;
-    expected_page_size = 0;
-    distribution_in_progress = 0;
-    printf("FW:NO_TARGETS\n");
-    return;
-  }
-
-  LOG_INFO("Session continues with %u active nodes:\n", session_nodes_count);
-  for(int i = 0; i < session_nodes_count; i++) {
-    LOG_INFO("  - ");
-    LOG_INFO_6ADDR(&session_nodes[i]);
-    LOG_INFO_("\n");
-  }
-
-  printf("FW:ACK\n");
-}
-
-void ota_coordinator_handle_start_report(const start_report_t *report,
-                                         const uip_ipaddr_t *sender_addr) {
-  if (!start_admission_in_progress) {
-    LOG_INFO("Ignoring START report outside admission window from ");
-    LOG_INFO_6ADDR(sender_addr);
-    LOG_INFO_("\n");
-    return;
-  }
-
-  int found = find_session_node(sender_addr);
-  if (found < 0) {
-    LOG_WARN("START report from unexpected node: ");
-    LOG_WARN_6ADDR(sender_addr);
-    LOG_WARN_("\n");
-    return;
-  }
-
-  if (node_replied[found]) {
-    LOG_INFO("Duplicate START report from ");
-    LOG_INFO_6ADDR(sender_addr);
-    LOG_INFO_(" ignored.\n");
-    return;
-  }
-
-  node_replied[found] = 1;
-  session_start_accepted[found] =
-      (report->status == OTA_START_STATUS_ACCEPTED);
-
-  LOG_INFO("START report from ");
-  LOG_INFO_6ADDR(sender_addr);
-  LOG_INFO_(": status=%u imageSecVer=%u runningSecVer=%u\n",
-            report->status, report->image_sec_ver, report->running_sec_ver);
-
-  uint8_t all_replied = 1;
-  for (int i = 0; i < session_nodes_count; i++) {
-    if (!node_replied[i]) {
-      all_replied = 0;
-      break;
-    }
-  }
-
-  if (all_replied) {
-    ctimer_stop(&start_admission_timer);
-    finish_start_admission(NULL);
-  }
-}
-
-/* Check if all active session nodes have received all chunks of the current page */
-static uint8_t page_is_complete(uint16_t total_chunks) {
-  if (session_nodes_count == 0) {
-    return 1;
-  }
-  for (int i = 0; i < session_nodes_count; i++) {
-    for (int chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
-      uint8_t byte_idx = chunk_idx / 8;
-      uint8_t bit_idx = chunk_idx % 8;
-      if ((session_bitmaps[i][byte_idx] & (1 << bit_idx)) == 0) {
-        return 0; /* A node is missing this chunk */
-      }
-    }
-  }
-  return 1;
-}
 
 /* Process thread for distributing a page to all nodes */
 PROCESS_THREAD(distribute_process, ev, data) {
@@ -218,7 +45,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
     pkt.type = PKT_TYPE_DATA;
     pkt.offset = chunk_abs_offset;
     pkt.length = chunk_len;
-    pkt.target_slot = OTA_TARGET_OFFCHIP;
+    pkt.target_slot = ota_target_slot;
     memcpy(pkt.data, &page_buffer[dist_chunk_idx * 64], chunk_len);
 
     send_to_all(&pkt, FW_PACKET_HEADER_LEN + chunk_len);
@@ -244,7 +71,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
     }
 
     /* Check if the page is complete on all nodes before doing a recovery round */
-    if (page_is_complete(total_chunks)) {
+    if (ota_page_is_complete(total_chunks)) {
       LOG_INFO("Page 0x%05lx successfully completed on all active nodes!\n",
                (unsigned long)page_start_offset);
       break;
@@ -272,7 +99,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
     end_pkt.type = PKT_TYPE_PAGE_END;
     end_pkt.offset = page_start_offset;
     end_pkt.length = page_crc;
-    end_pkt.target_slot = OTA_TARGET_OFFCHIP;
+    end_pkt.target_slot = ota_target_slot;
     send_to_all(&end_pkt, FW_PACKET_HEADER_LEN);
     LOG_INFO("Sent PAGE_END for offset 0x%05lx, waiting for bitmap...\n",
              (unsigned long)page_start_offset);
@@ -350,7 +177,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
     }
 
     /* Check completeness again after wait loop exits */
-    if (page_is_complete(total_chunks)) {
+    if (ota_page_is_complete(total_chunks)) {
       LOG_INFO("Page 0x%05lx successfully completed on all active nodes!\n",
                (unsigned long)page_start_offset);
       break;
@@ -380,7 +207,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
         pkt.type = PKT_TYPE_DATA;
         pkt.offset = chunk_abs_offset;
         pkt.length = chunk_len;
-        pkt.target_slot = OTA_TARGET_OFFCHIP;
+        pkt.target_slot = ota_target_slot;
         memcpy(pkt.data, &page_buffer[dist_chunk_idx * 64], chunk_len);
 
         LOG_INFO("Retransmitting chunk %u (offset 0x%05lx, missed by %u nodes)\n",
@@ -445,27 +272,20 @@ void ota_coordinator_handle_uart(const char *str) {
         strncpy(target, start_arg1, sizeof(target) - 1);
       }
 
-      uint8_t target_slot = parse_ota_target(target);
+      uint8_t target_slot = ota_parse_target(target);
       if (target_slot == OTA_TARGET_INVALID) {
         LOG_WARN("Invalid OTA target: %s\n", target);
         return;
       }
 
-      if (start_admission_in_progress) {
-        ctimer_stop(&start_admission_timer);
-        start_admission_in_progress = 0;
-      }
+      ota_start_admission_cancel();
 
       /* Populate session nodes before START so reports can be matched. */
-      populate_session_nodes_from_routes();
+      ota_populate_session_nodes_from_routes();
       if(session_nodes_count == 0) {
         LOG_WARN("No active routes at session start!\n");
-        current_file_size = 0;
-        page_start_offset = 0;
-        page_bytes_received = 0;
-        expected_page_size = 0;
-        distribution_in_progress = 0;
-        printf("FW:NO_TARGETS\n");
+        ota_reset_transfer_state(0);
+        ota_notify_uart_no_targets();
         return;
       }
 
@@ -477,34 +297,24 @@ void ota_coordinator_handle_uart(const char *str) {
         LOG_INFO_("\n");
       }
 
-      memset(node_replied, 0, sizeof(node_replied));
-      memset(session_start_accepted, 0, sizeof(session_start_accepted));
-
       fw_packet_t pkt;
       pkt.type = PKT_TYPE_START;
       pkt.offset = offset;
       pkt.length = image_sec_ver;
       pkt.target_slot = target_slot;
+      ota_target_slot = target_slot;
       send_to_all(&pkt, FW_PACKET_HEADER_LEN);
-      LOG_INFO("Sent START, size: %lu, secVer: %u, target: offchip\n",
-               (unsigned long)offset, image_sec_ver);
+      LOG_INFO("Sent START, size: %lu, secVer: %u, target: %s\n",
+               (unsigned long)offset, image_sec_ver,
+               ota_target_name(ota_target_slot));
 
       /* Initialize page variables */
-      current_file_size = offset;
-      page_start_offset = 0;
-      page_bytes_received = 0;
-      expected_page_size = (current_file_size > PAGE_SIZE)
-                               ? PAGE_SIZE
-                               : current_file_size;
-      distribution_in_progress = 0;
-
-      start_admission_in_progress = 1;
-      ctimer_set(&start_admission_timer, START_ADMISSION_TIMEOUT,
-                 finish_start_admission, NULL);
+      ota_reset_transfer_state(offset);
+      ota_start_admission_begin();
     }
   } else if (str[3] == 'D') {
     if (sscanf(str, "FW:D:%lx:%x:%128s", &offset, &length, hexdata) >= 3) {
-      if (start_admission_in_progress) {
+      if (ota_start_admission_is_in_progress()) {
         LOG_INFO("[ERROR] START admission in progress, ignoring UART chunk!\n");
       } else if (session_nodes_count == 0) {
         LOG_INFO("[ERROR] No active OTA targets, ignoring UART chunk!\n");
@@ -550,7 +360,7 @@ void ota_coordinator_handle_uart(const char *str) {
       pkt.type = PKT_TYPE_VERIFY;
       pkt.offset = offset;
       pkt.length = 0;
-      pkt.target_slot = OTA_TARGET_OFFCHIP;
+      pkt.target_slot = ota_target_slot;
       send_to_all(&pkt, FW_PACKET_HEADER_LEN);
       LOG_INFO("Sent VERIFY, expected checksum: 0x%08lx\n",
                (unsigned long)offset);

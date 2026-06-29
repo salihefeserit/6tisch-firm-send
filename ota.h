@@ -67,7 +67,7 @@
 #define OTA_INTERNAL_VECTOR_MIN_ADDR 0x000000A8UL
 #define OTA_INTERNAL_BIM_ADDR 0x00056000UL
 
-#define OTA_TARGET_OFFCHIP 0
+#define OTA_TARGET_OFFCHIP 0x80
 #define OTA_TARGET_INVALID 0xff
 
 #define OTA_START_SEC_VER_UNKNOWN 0
@@ -75,6 +75,7 @@
 #define OTA_START_STATUS_ACCEPTED 0
 #define OTA_START_STATUS_REJECTED_VERSION 1
 #define OTA_START_STATUS_REJECTED_TARGET 2
+#define OTA_START_STATUS_REJECTED_SAME_SLOT 3
 
 typedef struct __attribute__((packed)) {
   uint8_t type;
@@ -116,6 +117,7 @@ extern uip_ipaddr_t session_nodes[MAX_NODES];
 extern uint8_t session_nodes_count;
 extern uint8_t node_replied[MAX_NODES];
 extern uint8_t session_bitmaps[MAX_NODES][8];
+extern uint8_t retry_count;
 
 /* Shared helper/control functions */
 uint8_t hex2val(char c);
@@ -129,6 +131,15 @@ extern process_event_t event_bitmap_received;
 int ota_coordinator_has_routes(void);
 int find_session_node_by_addr(const uip_ipaddr_t *addr);
 void remove_session_node(int index);
+void ota_notify_uart_no_targets(void);
+void ota_reset_transfer_state(uint32_t file_size);
+void ota_populate_session_nodes_from_routes(void);
+uint8_t ota_parse_target(const char *target);
+const char *ota_target_name(uint8_t target);
+uint8_t ota_page_is_complete(uint16_t total_chunks);
+uint8_t ota_start_admission_is_in_progress(void);
+void ota_start_admission_cancel(void);
+void ota_start_admission_begin(void);
 void ota_coordinator_handle_uart(const char *str);
 void ota_coordinator_handle_start_report(const start_report_t *report,
                                          const uip_ipaddr_t *sender_addr);

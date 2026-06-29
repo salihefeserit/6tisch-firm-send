@@ -21,7 +21,7 @@ APP_V_MINOR ?= 0
 APP_V_PATCH ?= 0
 APP_V_BUILD ?= 0
 OTA_EXPECTED_IMG_TYPE ?= OAD_IMG_TYPE_APP
-OTA_STAGE_RESET_AFTER_VERIFY ?= 0
+OTA_STAGE_RESET_AFTER_VERIFY ?= 1
 
 # Simple Energest
 MODULES += $(CONTIKI_NG_SERVICES_DIR)/simple-energest
@@ -31,6 +31,7 @@ ifeq ($(MAKE_WITH_BIM_DUAL_ONCHIP),1)
   ifeq ($(MAKE_WITH_BIM_OFFCHIP),1)
     $(error MAKE_WITH_BIM_DUAL_ONCHIP and MAKE_WITH_BIM_OFFCHIP are mutually exclusive)
   endif
+  PROJECT_SOURCEFILES += ota-coordinator-common.c
   PROJECT_SOURCEFILES += coordinator-dual-onchip.c sensor-node-dual-onchip.c
   PROJECT_SOURCEFILES += oad_image_header_app.c ota-flash.c ota-metadata.c
   CFLAGS += -DOTA_WITH_BIM_DUAL_ONCHIP=1
@@ -46,6 +47,7 @@ ifeq ($(MAKE_WITH_BIM_DUAL_ONCHIP),1)
   CFLAGS += -idirafter $(TI_FULL_SDK_DIR)/source
 else ifeq ($(MAKE_WITH_BIM_OFFCHIP),1)
   MODULES += arch/dev/storage/ext-flash
+  PROJECT_SOURCEFILES += ota-coordinator-common.c
   PROJECT_SOURCEFILES += coordinator-offchip.c sensor-node-offchip.c
   PROJECT_SOURCEFILES += oad_image_header_app.c
   CFLAGS += -DOTA_WITH_BIM_OFFCHIP=1

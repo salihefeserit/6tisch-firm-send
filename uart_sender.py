@@ -142,11 +142,12 @@ def send_firmware(port, filename, image_sec_ver=None, target_slot=None):
         f_log.write(f"=== New OTA Session: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
     target_text = (target_slot or "offchip").strip().lower()
+    if image_sec_ver is None:
+        print("Error: target requires <image_sec_ver>.")
+        ser.close()
+        sys.exit(1)
+
     if target_text == "offchip":
-        if image_sec_ver is None:
-            print("Error: offchip target requires <image_sec_ver>.")
-            ser.close()
-            sys.exit(1)
         print(f"Sending START (secVer={image_sec_ver}, target=offchip)...")
         cmd = f"FW:S:{file_size:08X}:{image_sec_ver}:offchip\n"
     else:
@@ -156,8 +157,9 @@ def send_firmware(port, filename, image_sec_ver=None, target_slot=None):
             print(f"Error: {e}")
             ser.close()
             sys.exit(1)
-        print(f"Sending START (target slot={'A' if target_slot_id == OTA_SLOT_A else 'B'})...")
-        cmd = f"FW:S:{file_size:08X}:{target_slot_id}\n"
+        target_name = "A" if target_slot_id == OTA_SLOT_A else "B"
+        print(f"Sending START (secVer={image_sec_ver}, target slot={target_name})...")
+        cmd = f"FW:S:{file_size:08X}:{image_sec_ver}:{target_name}\n"
 
     start_status = send_start_and_wait(ser, cmd, timeout=15.0)
     if start_status == "NO_TARGETS":
@@ -221,18 +223,14 @@ def send_firmware(port, filename, image_sec_ver=None, target_slot=None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python uart_sender.py <serial_port> <firmware.bin> [image_sec_ver] [target]")
+        print("Usage: python uart_sender.py <serial_port> <firmware.bin> <image_sec_ver> [target]")
         print("Example: python uart_sender.py /dev/tty.usbmodem00000001 sensor-node-offchip.bin 2 offchip")
-        print("Example: python uart_sender.py /dev/tty.usbmodem00000001 sensor-node-slot-b.bin B")
+        print("Example: python uart_sender.py /dev/tty.usbmodem00000001 sensor-node-slot-b.bin 2 B")
         sys.exit(1)
     image_sec_ver = None
     target = None
     if len(sys.argv) >= 4:
-        arg3 = sys.argv[3]
-        if arg3.strip().lower() in ("0", "1", "a", "b", "slot-a", "slot-b", "slota", "slotb"):
-            target = arg3
-        else:
-            image_sec_ver = parse_image_sec_ver(arg3)
+        image_sec_ver = parse_image_sec_ver(sys.argv[3])
     if len(sys.argv) >= 5:
         target = sys.argv[4]
     if target is None and image_sec_ver is not None:

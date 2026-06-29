@@ -157,7 +157,8 @@ static int stage_downloaded_image(uint8_t target_slot) {
   return 1;
 }
 
-static int start_ota_session(uint8_t target_slot, uint32_t file_size) {
+static int start_ota_session(uint8_t target_slot, uint32_t file_size,
+                             uint16_t image_sec_ver) {
   ota_session_valid = 0;
   ota_rejected_same_slot = 0;
   ota_target_slot = target_slot;
@@ -166,6 +167,13 @@ static int start_ota_session(uint8_t target_slot, uint32_t file_size) {
 
   if (target_slot > OTA_SLOT_B) {
     LOG_WARN("[OTA] Invalid target slot %u\n", target_slot);
+    return 0;
+  }
+
+  if (image_sec_ver != OTA_START_SEC_VER_UNKNOWN &&
+      image_sec_ver <= ota_image_header.secInfoSeg.secVer) {
+    LOG_WARN("[OTA] Rejecting START: image secVer %u <= running secVer %u\n",
+             image_sec_ver, ota_image_header.secInfoSeg.secVer);
     return 0;
   }
 
@@ -312,9 +320,11 @@ static char slot_name(uint8_t slot) {
   return '?';
 }
 
-static int start_ota_session(uint8_t target_slot, uint32_t file_size) {
+static int start_ota_session(uint8_t target_slot, uint32_t file_size,
+                             uint16_t image_sec_ver) {
   (void)target_slot;
   (void)file_size;
+  (void)image_sec_ver;
   LOG_WARN("[OTA] BIM dual-onchip support is not enabled in this build\n");
   return 0;
 }
@@ -412,6 +422,52 @@ static void do_send_bitmap(void) {
   }
 }
 
+static uint16_t running_sec_ver(void) {
+#if OTA_WITH_BIM_DUAL_ONCHIP
+  return ota_image_header.secInfoSeg.secVer;
+#else
+  return 0;
+#endif
+}
+
+static void send_start_report(uint8_t status, uint16_t image_sec_ver,
+                              uint8_t target_slot) {
+  if (node_id == 1) {
+    return;
+  }
+
+  uip_ipaddr_t root_ip;
+  if (NETSTACK_ROUTING.get_root_ipaddr == NULL ||
+      !NETSTACK_ROUTING.get_root_ipaddr(&root_ip) ||
+      uip_is_addr_unspecified(&root_ip)) {
+    return;
+  }
+
+  start_report_t report;
+  report.type = PKT_TYPE_START_REPORT;
+  report.status = status;
+  report.image_sec_ver = image_sec_ver;
+  report.running_sec_ver = running_sec_ver();
+  report.target_slot = target_slot;
+
+  uip_ipaddr_t coordinator_ll_ip;
+  uip_ipaddr_copy(&coordinator_ll_ip, &root_ip);
+  memset(&coordinator_ll_ip.u8[0], 0, 8);
+  coordinator_ll_ip.u8[0] = 0xfe;
+  coordinator_ll_ip.u8[1] = 0x80;
+
+  const uip_ipaddr_t *parent_ip = uip_ds6_defrt_choose();
+  if (parent_ip != NULL && uip_ipaddr_cmp(parent_ip, &coordinator_ll_ip)) {
+    simple_udp_sendto(&udp_conn, &report, sizeof(report), &coordinator_ll_ip);
+  } else {
+    simple_udp_sendto(&udp_conn, &report, sizeof(report), &root_ip);
+  }
+
+  LOG_INFO("[OTA] START report sent: status=%u imageSecVer=%u "
+           "runningSecVer=%u\n",
+           status, image_sec_ver, report.running_sec_ver);
+}
+
 static void send_report_callback(void *ptr) {
   LOG_INFO("[OTA] Sending bitmap report\n");
   do_send_bitmap();
@@ -463,7 +519,10 @@ void udp_rx_callback(struct simple_udp_connection *c,
                      const uip_ipaddr_t *receiver_addr, uint16_t receiver_port,
                      const uint8_t *data, uint16_t datalen) {
   if (node_id == 1) {
-    if (datalen >= sizeof(bitmap_report_t)) {
+    if (datalen >= sizeof(start_report_t) && data[0] == PKT_TYPE_START_REPORT) {
+      const start_report_t *report = (const start_report_t *)data;
+      ota_coordinator_handle_start_report(report, sender_addr);
+    } else if (datalen >= sizeof(bitmap_report_t)) {
       const bitmap_report_t *report = (const bitmap_report_t *)data;
       if (report->type == PKT_TYPE_BITMAP_REPORT) {
         LOG_INFO("OTA report from ");
@@ -564,8 +623,11 @@ void udp_rx_callback(struct simple_udp_connection *c,
   uint8_t should_forward = (is_from_parent || is_from_coordinator) && !is_leaf;
 
   if (pkt->type == PKT_TYPE_START) {
-    LOG_INFO("[OTA] START received. File size: %lu, target slot: %c\n",
-             (unsigned long)pkt->offset, slot_name(pkt->target_slot));
+    uint16_t image_sec_ver = pkt->length;
+    LOG_INFO("[OTA] START received. File size: %lu, imageSecVer: %u, "
+             "target slot: %c\n",
+             (unsigned long)pkt->offset, image_sec_ver,
+             slot_name(pkt->target_slot));
 
     if (should_forward) {
       send_to_all(pkt, datalen);
@@ -579,13 +641,27 @@ void udp_rx_callback(struct simple_udp_connection *c,
     memset(page_bitmap, 0, sizeof(page_bitmap));
     page_0_erased = 0;
 
-    if (!start_ota_session(pkt->target_slot, current_file_size)) {
+    if (!start_ota_session(pkt->target_slot, current_file_size,
+                           image_sec_ver)) {
       LOG_WARN("[OTA] START rejected locally\n");
+      if (pkt->target_slot > OTA_SLOT_B) {
+        send_start_report(OTA_START_STATUS_REJECTED_TARGET, image_sec_ver,
+                          pkt->target_slot);
+      } else if (image_sec_ver != OTA_START_SEC_VER_UNKNOWN &&
+                 image_sec_ver <= running_sec_ver()) {
+        send_start_report(OTA_START_STATUS_REJECTED_VERSION, image_sec_ver,
+                          pkt->target_slot);
+      }
       if (ota_rejected_same_slot) {
+        send_start_report(OTA_START_STATUS_REJECTED_SAME_SLOT, image_sec_ver,
+                          pkt->target_slot);
         send_same_slot_reject_report();
       }
       return;
     }
+
+    send_start_report(OTA_START_STATUS_ACCEPTED, image_sec_ver,
+                      pkt->target_slot);
 
   } else if (pkt->type == PKT_TYPE_DATA) {
     LOG_INFO("[OTA] DATA received: offset 0x%05lx, len %u\n",

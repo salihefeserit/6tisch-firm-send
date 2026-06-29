@@ -5,65 +5,7 @@
 #include "net/ipv6/uip-ds6.h"
 #include "ota.h"
 
-uip_ipaddr_t session_nodes[MAX_NODES];
-uint8_t session_nodes_count = 0;
-uint8_t node_replied[MAX_NODES];
-uint8_t session_bitmaps[MAX_NODES][8];
-uint8_t retry_count = 0;
-
-process_event_t event_bitmap_received;
-
 PROCESS(distribute_process, "OTA Distribution Process");
-
-static void notify_uart_no_targets(void) {
-  printf("FW:NO_TARGETS\n");
-}
-
-int find_session_node_by_addr(const uip_ipaddr_t *addr) {
-  for (int i = 0; i < session_nodes_count; i++) {
-    if (memcmp(&session_nodes[i].u8[8], &addr->u8[8], 8) == 0) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-void remove_session_node(int index) {
-  if (index < 0 || index >= session_nodes_count) {
-    return;
-  }
-
-  for (int i = index + 1; i < session_nodes_count; i++) {
-    uip_ipaddr_copy(&session_nodes[i - 1], &session_nodes[i]);
-    node_replied[i - 1] = node_replied[i];
-    memcpy(session_bitmaps[i - 1], session_bitmaps[i], 8);
-  }
-  session_nodes_count--;
-  if (session_nodes_count == 0) {
-    notify_uart_no_targets();
-  }
-}
-
-int ota_coordinator_has_routes(void) {
-  return tsch_is_associated && (uip_ds6_route_head() != NULL);
-}
-
-/* Check if all active session nodes have received all chunks of the current page */
-static uint8_t page_is_complete(uint16_t total_chunks) {
-  if (session_nodes_count == 0) {
-    return 1;
-  }
-  for (int i = 0; i < session_nodes_count; i++) {
-    for (int chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
-      uint8_t byte_idx = chunk_idx / 8;
-      uint8_t bit_idx = chunk_idx % 8;
-      if ((session_bitmaps[i][byte_idx] & (1 << bit_idx)) == 0) {
-        return 0; /* A node is missing this chunk */
-      }
-    }
-  }
-  return 1;
-}
 
 /* Process thread for distributing a page to all nodes */
 PROCESS_THREAD(distribute_process, ev, data) {
@@ -94,7 +36,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
   if (session_nodes_count == 0) {
     LOG_INFO("No active target nodes. Skipping page transmission.\n");
     distribution_in_progress = 0;
-    notify_uart_no_targets();
+    ota_notify_uart_no_targets();
     PROCESS_EXIT();
   }
 
@@ -135,7 +77,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
     }
 
     /* Check if the page is complete on all nodes before doing a recovery round */
-    if (page_is_complete(total_chunks)) {
+    if (ota_page_is_complete(total_chunks)) {
       LOG_INFO("Page 0x%05lx successfully completed on all active nodes!\n",
                (unsigned long)page_start_offset);
       break;
@@ -241,7 +183,7 @@ PROCESS_THREAD(distribute_process, ev, data) {
     }
 
     /* Check completeness again after wait loop exits */
-    if (page_is_complete(total_chunks)) {
+    if (ota_page_is_complete(total_chunks)) {
       LOG_INFO("Page 0x%05lx successfully completed on all active nodes!\n",
                (unsigned long)page_start_offset);
       break;
@@ -308,9 +250,12 @@ void ota_coordinator_handle_uart(const char *str) {
   extern struct process serial_shell_process;
   uint32_t offset;
   unsigned int length;
-  unsigned int target_slot;
+  char start_arg1[16];
+  char start_arg2[16];
   static char hexdata[130];
 
+  memset(start_arg1, 0, sizeof(start_arg1));
+  memset(start_arg2, 0, sizeof(start_arg2));
   memset(hexdata, 0, sizeof(hexdata));
 
   if (str[3] == 'S') {
@@ -319,65 +264,68 @@ void ota_coordinator_handle_uart(const char *str) {
     if (process_is_running(&serial_shell_process)) {
       process_exit(&serial_shell_process);
     }
-    if (sscanf(str, "FW:S:%lx:%u", &offset, &target_slot) == 2 &&
-        target_slot <= OTA_SLOT_B) {
+    int start_fields =
+        sscanf(str, "FW:S:%lx:%15[^:]:%15s", &offset, start_arg1,
+               start_arg2);
+    if (start_fields >= 2) {
+      uint16_t image_sec_ver = OTA_START_SEC_VER_UNKNOWN;
+      uint8_t target_slot;
+      const char *target_arg = start_arg1;
+
+      if (start_fields >= 3) {
+        image_sec_ver = (uint16_t)strtoul(start_arg1, NULL, 0);
+        target_arg = start_arg2;
+      }
+
+      target_slot = ota_parse_target(target_arg);
+      if (target_slot == OTA_TARGET_INVALID) {
+        LOG_WARN("[ERROR] Invalid OTA target: %s\n", target_arg);
+        ota_reset_transfer_state(0);
+        ota_notify_uart_no_targets();
+        return;
+      }
+
+      ota_start_admission_cancel();
+
+      ota_populate_session_nodes_from_routes();
+      if(session_nodes_count == 0) {
+        LOG_WARN("No active routes at session start!\n");
+        ota_reset_transfer_state(0);
+        ota_notify_uart_no_targets();
+        return;
+      }
+
+      LOG_INFO("Session admission started for %u routed nodes:\n",
+               session_nodes_count);
+      for(int i = 0; i < session_nodes_count; i++) {
+        LOG_INFO("  - ");
+        LOG_INFO_6ADDR(&session_nodes[i]);
+        LOG_INFO_("\n");
+      }
+
       fw_packet_t pkt;
       pkt.type = PKT_TYPE_START;
       pkt.offset = offset;
-      pkt.length = 0;
-      pkt.target_slot = (uint8_t)target_slot;
-      ota_target_slot = (uint8_t)target_slot;
+      pkt.length = image_sec_ver;
+      pkt.target_slot = target_slot;
+      ota_target_slot = target_slot;
       send_to_all(&pkt, FW_PACKET_HEADER_LEN);
-      LOG_INFO("Sent START, size: %lu, target slot: %c\n",
-               (unsigned long)offset,
-               ota_target_slot == OTA_SLOT_A ? 'A' : 'B');
+      LOG_INFO("Sent START, size: %lu, secVer: %u, target: %s\n",
+               (unsigned long)offset, image_sec_ver,
+               ota_target_name(ota_target_slot));
 
-      /* Populate session nodes from RPL routing table */
-      session_nodes_count = 0;
-      uip_ds6_route_t *route;
-      for(route = uip_ds6_route_head(); route != NULL; route = uip_ds6_route_next(route)) {
-        if(session_nodes_count < MAX_NODES) {
-          uip_ipaddr_copy(&session_nodes[session_nodes_count], &route->ipaddr);
-          session_nodes_count++;
-        } else {
-          LOG_WARN("Too many routing entries! Truncating to MAX_NODES (%d)\n", MAX_NODES);
-          break;
-        }
-      }
-      if(session_nodes_count == 0) {
-        LOG_WARN("No active routes at session start!\n");
-      } else {
-        LOG_INFO("Session started with %u active nodes:\n", session_nodes_count);
-        for(int i = 0; i < session_nodes_count; i++) {
-          LOG_INFO("  - ");
-          LOG_INFO_6ADDR(&session_nodes[i]);
-          LOG_INFO_("\n");
-        }
-      }
-
-      /* Initialize page variables */
-      current_file_size = offset;
-      ota_target_slot = (uint8_t)target_slot;
-      page_start_offset = 0;
-      page_bytes_received = 0;
-      expected_page_size = (current_file_size > PAGE_SIZE)
-                               ? PAGE_SIZE
-                               : current_file_size;
-      distribution_in_progress = 0;
-
-      /* Acknowledge START command */
-      printf("FW:ACK\n");
-      if (session_nodes_count == 0) {
-        notify_uart_no_targets();
-      }
+      ota_reset_transfer_state(offset);
+      ota_start_admission_begin();
     } else {
-      LOG_WARN("[ERROR] START command must be FW:S:<size>:<slot>, slot 0=A 1=B\n");
+      LOG_WARN("[ERROR] START command must be FW:S:<size>:<secVer>:<slot>, slot 0=A 1=B\n");
     }
   } else if (str[3] == 'D') {
     if (sscanf(str, "FW:D:%lx:%x:%128s", &offset, &length, hexdata) >= 3) {
-      if (session_nodes_count == 0) {
+      if (ota_start_admission_is_in_progress()) {
+        LOG_INFO("[ERROR] START admission in progress, ignoring UART chunk!\n");
+      } else if (session_nodes_count == 0) {
         LOG_INFO("[OTA] No active target nodes, rejecting UART DATA chunk.\n");
-        notify_uart_no_targets();
+        ota_notify_uart_no_targets();
       } else if (distribution_in_progress) {
         LOG_INFO("[ERROR] Page distribution in progress, ignoring UART chunk!\n");
       } else if (offset >= page_start_offset &&
@@ -418,7 +366,7 @@ void ota_coordinator_handle_uart(const char *str) {
     if (sscanf(str, "FW:V:%lx", &offset) == 1) {
       if (session_nodes_count == 0) {
         LOG_INFO("[OTA] No active target nodes, ignoring VERIFY.\n");
-        notify_uart_no_targets();
+        ota_notify_uart_no_targets();
         return;
       }
 
