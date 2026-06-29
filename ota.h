@@ -30,7 +30,10 @@
 
 #define UDP_PORT 8765
 
-/* OTA Packet Definitions */
+/* -------------------------------------------------------------------------- */
+/* Wire protocol                                                               */
+/* -------------------------------------------------------------------------- */
+
 #define PKT_TYPE_START 0
 #define PKT_TYPE_DATA 1
 #define PKT_TYPE_VERIFY 2
@@ -38,11 +41,17 @@
 #define PKT_TYPE_PAGE_END 4
 #define PKT_TYPE_START_REPORT 5
 
+/* PAGE/bitmap report status values. */
 #define OTA_REPORT_STATUS_OK 0
 #define OTA_REPORT_STATUS_REJECTED_SAME_SLOT 1
 
-#define PAGE_SIZE 4096
+/* START admission status values. */
+#define OTA_START_STATUS_ACCEPTED 0
+#define OTA_START_STATUS_REJECTED_VERSION 1
+#define OTA_START_STATUS_REJECTED_TARGET 2
+#define OTA_START_STATUS_REJECTED_SAME_SLOT 3
 
+/* Architecture-neutral target identifiers carried in fw_packet_t.target_slot. */
 #ifndef OTA_SLOT_A
 #define OTA_SLOT_A 0
 #endif
@@ -50,6 +59,17 @@
 #define OTA_SLOT_B 1
 #endif
 #define OTA_SLOT_INVALID 0xff
+
+#define OTA_TARGET_OFFCHIP 0x80
+#define OTA_TARGET_INVALID 0xff
+
+#define OTA_START_SEC_VER_UNKNOWN 0
+
+#define PAGE_SIZE 4096
+
+/* -------------------------------------------------------------------------- */
+/* Flash layout                                                                */
+/* -------------------------------------------------------------------------- */
 
 #define OTA_SLOT_A_START 0x00000000UL
 #define OTA_SLOT_A_SIZE 0x0002A000UL
@@ -67,15 +87,9 @@
 #define OTA_INTERNAL_VECTOR_MIN_ADDR 0x000000A8UL
 #define OTA_INTERNAL_BIM_ADDR 0x00056000UL
 
-#define OTA_TARGET_OFFCHIP 0x80
-#define OTA_TARGET_INVALID 0xff
-
-#define OTA_START_SEC_VER_UNKNOWN 0
-
-#define OTA_START_STATUS_ACCEPTED 0
-#define OTA_START_STATUS_REJECTED_VERSION 1
-#define OTA_START_STATUS_REJECTED_TARGET 2
-#define OTA_START_STATUS_REJECTED_SAME_SLOT 3
+/* -------------------------------------------------------------------------- */
+/* Packet structures                                                           */
+/* -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
   uint8_t type;
@@ -102,7 +116,10 @@ typedef struct __attribute__((packed)) {
   uint8_t target_slot;
 } start_report_t;
 
-/* Global variables shared between modules */
+/* -------------------------------------------------------------------------- */
+/* Shared transfer state                                                       */
+/* -------------------------------------------------------------------------- */
+
 extern uint32_t current_file_size;
 extern uint8_t page_buffer[PAGE_SIZE];
 extern uint32_t page_start_offset;
@@ -119,15 +136,16 @@ extern uint8_t node_replied[MAX_NODES];
 extern uint8_t session_bitmaps[MAX_NODES][8];
 extern uint8_t retry_count;
 
-/* Shared helper/control functions */
 uint8_t hex2val(char c);
 void send_to_all(const fw_packet_t *pkt, uint16_t len);
 
-/* Processes declared globally */
 PROCESS_NAME(distribute_process);
 extern process_event_t event_bitmap_received;
 
-/* Coordinator-specific forward declarations */
+/* -------------------------------------------------------------------------- */
+/* Coordinator API                                                             */
+/* -------------------------------------------------------------------------- */
+
 int ota_coordinator_has_routes(void);
 int find_session_node_by_addr(const uip_ipaddr_t *addr);
 void remove_session_node(int index);
@@ -143,10 +161,14 @@ void ota_start_admission_begin(void);
 void ota_coordinator_handle_uart(const char *str);
 void ota_coordinator_handle_start_report(const start_report_t *report,
                                          const uip_ipaddr_t *sender_addr);
+
+/* -------------------------------------------------------------------------- */
+/* Sensor-node API                                                             */
+/* -------------------------------------------------------------------------- */
+
 void ota_sensor_boot_check(void);
 void ota_sensor_confirm_stable(void);
 
-/* Sensor-node UDP callback */
 void udp_rx_callback(struct simple_udp_connection *c,
                      const uip_ipaddr_t *sender_addr,
                      uint16_t sender_port,

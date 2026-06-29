@@ -1,337 +1,472 @@
-# 6TiSCH Sensor-Node to Hardware (sn-to-hw)
+# 6TiSCH OTA Firmware Sender
 
-A Contiki-NG example demonstrating a dual-role 6TiSCH network running on the
-**Texas Instruments CC1352R1** LaunchPad (SimpleLink platform). One device acts
-as the TSCH coordinator and RPL DAG root; every other device is a sensor node
-that periodically sends a UDP message to the coordinator once the network is
-ready.
+This project implements OTA firmware distribution over a Contiki-NG 6TiSCH/RPL
+network. A coordinator receives the firmware image over UART, distributes it to
+sensor nodes over UDP, and runs per-page recovery using bitmap reports from the
+nodes.
+
+The project supports two BIM/OAD application layouts:
+
+- **dual-onchip BIM**: the new image is written to the inactive internal flash
+  slot. The target is selected as slot `A` or slot `B`.
+- **offchip BIM**: the new image is written to external flash. The target is
+  selected as `offchip`.
+
+The coordinator is architecture-neutral. The UART sender declares the intended
+target; the coordinator forwards that target in START/DATA/PAGE_END/VERIFY
+packets. Image compatibility, secVer policy, and target-slot admission are
+decided by each sensor node during START admission.
 
 ---
 
-## Table of Contents
+## Contents
 
-- [Overview](#overview)
-- [Network Architecture](#network-architecture)
-- [How It Works](#how-it-works)
-- [Hardware Requirements](#hardware-requirements)
-- [Prerequisites](#prerequisites)
-- [Project Structure](#project-structure)
-- [Key Configuration Parameters](#key-configuration-parameters)
+- [Architecture](#architecture)
+- [OTA Flow](#ota-flow)
+- [Project Layout](#project-layout)
+- [Requirements](#requirements)
 - [Building](#building)
-  - [Coordinator (node\_id = 1)](#coordinator-node_id--1)
-  - [Sensor Node (node\_id ≥ 2)](#sensor-node-node_id--2)
-- [Flashing](#flashing)
-- [Simulation with Cooja](#simulation-with-cooja)
-- [Expected Log Output](#expected-log-output)
-- [Timing Behaviour](#timing-behaviour)
-- [Optional Build Flags](#optional-build-flags)
+- [Initial Flashing](#initial-flashing)
+- [Sending OTA Images over UART](#sending-ota-images-over-uart)
+- [Protocol Summary](#protocol-summary)
+- [Admission and Rejection Rules](#admission-and-rejection-rules)
+- [Important Configuration](#important-configuration)
+- [Logs and Verification](#logs-and-verification)
 - [Troubleshooting](#troubleshooting)
-- [License](#license)
 
 ---
 
-## Overview
+## Architecture
 
-| Role | node\_id | Stack role | UDP role |
-|------|----------|------------|----------|
-| **Coordinator** | `1` | TSCH coordinator + RPL DAG root | UDP server (receives messages) |
-| **Sensor Node** | `≥ 2` | TSCH node + RPL leaf | UDP client (sends messages) |
+The network has two runtime roles:
 
-The project is self-contained: **a single firmware binary** determines its own
-role at runtime using `node_id`. No separate coordinator firmware is needed.
+| Role | Selection | Responsibility |
+|------|-----------|----------------|
+| Coordinator | Built with `NODEID=1` | Starts the RPL DAG root, receives firmware over UART, distributes it to sensor nodes |
+| Sensor node | Built without `NODEID` | Uses its hardware EUI-64 address, receives OTA packets, writes the image to the selected flash backend |
 
----
+The codebase is split along these boundaries:
 
-## Network Architecture
+| Layer | Files | Responsibility |
+|-------|-------|----------------|
+| Application bootstrap | `node.c` | Starts the coordinator or sensor-node role and registers the UDP socket |
+| Shared protocol | `ota.h` | Packet types, target constants, status codes, public API |
+| Shared transfer state | `ota-common.c` | Page buffer, file offsets, UDP send helper |
+| Common coordinator | `ota-coordinator.c` | Handles UART commands, distributes pages, retransmits missing chunks |
+| Coordinator session/admission | `ota-coordinator-session.c` | Builds sessions from routes and collects START reports |
+| Common sensor-node OTA flow | `ota-sensor.c` | START/DATA/PAGE_END/VERIFY state machine, forwarding, bitmap reports |
+| Sensor backend API | `ota-sensor-backend.h` | Storage, validation, and staging interface used by `ota-sensor.c` |
+| Dual-onchip sensor backend | `sensor-node-dual-onchip.c` | Internal flash slot writes, metadata staging, stable boot confirmation |
+| Offchip sensor backend | `sensor-node-offchip.c` | External flash writes, off-chip OAD header validation, reset staging |
+| Dual-onchip flash helpers | `ota-flash.c/.h`, `ota-metadata.c/.h` | Internal flash and BIM metadata operations |
+| OAD header integration | `oad_image_header_app.c/.h` | TI OAD image header symbols |
 
-```
-┌──────────────────────────────────────────────────┐
-│               6TiSCH Network (PANID 0x81a5)      │
-│                                                  │
-│   ┌─────────────┐        ┌─────────────────┐     │
-│   │  Sensor     │──UDP──▶│  Coordinator    │     │
-│   │  Node #2    │        │  (node_id = 1)  │     │
-│   └─────────────┘        │  RPL DAG Root   │     │
-│                           │  UDP Server     │     │
-│   ┌─────────────┐        └─────────────────┘     │
-│   │  Sensor     │──UDP──▶                        │
-│   │  Node #3    │                                │
-│   └─────────────┘                                │
-│            ...                                   │
-└──────────────────────────────────────────────────┘
-```
-
-- **MAC layer**: IEEE 802.15.4e TSCH (Time-Slotted Channel Hopping)
-- **Routing**: RPL (non-storing mode, default)
-- **Transport**: UDP over IPv6 / 6LoWPAN
-- **RF band**: 2.4 GHz, Channel 26
-- **Hopping sequence**: single channel (`TSCH_HOPPING_SEQUENCE_1_1`) — suitable
-  for demos and Cooja simulation
+The old `coordinator-dual-onchip.c` and `coordinator-offchip.c` split has been
+removed. Both BIM layouts now use the same coordinator implementation. The
+architecture-specific code lives in the sensor-node backend and linker scripts.
 
 ---
 
-## How It Works
+## OTA Flow
 
-### Coordinator (node\_id = 1)
-1. Calls `NETSTACK_ROUTING.root_start()` to become the RPL DAG root.
-2. Starts the TSCH MAC layer (`NETSTACK_MAC.on()`).
-3. Registers a UDP socket on port **8765** and listens for incoming messages.
-4. Logs every received "Hello World!" payload along with the sender's IPv6
-   address.
-
-### Sensor Node (node\_id ≥ 2)
-1. Starts the TSCH MAC layer and waits for TSCH association (beacon from the
-   coordinator).
-2. Polls `network_ready_to_send_to_root()` in a tight loop (using
-   `PROCESS_PAUSE()`) until:
-   - TSCH is associated (`tsch_is_associated == true`), **and**
-   - The RPL DODAG is reachable (`node_is_reachable()`), **and**
-   - The root's IPv6 address is known (`get_root_ipaddr()`).
-3. Once network-ready, starts a **10-second periodic timer** and sends
-   `"Hello World!"` to the coordinator on every tick.
-4. If connectivity is lost between ticks, the send is deferred and a warning is
-   logged.
-
----
-
-## Hardware Requirements
-
-| Item | Details |
-|------|---------|
-| Development board | Texas Instruments **CC1352R1** LaunchPad or LPSTK SensorTag |
-| Platform in Contiki-NG | `simplelink` |
-| Board identifier | `sensortag/cc1352r1` |
-| RF frequency | **2.4 GHz** (IEEE 802.15.4, channels 11–26) |
-| Minimum devices | 2 (1 coordinator + 1 sensor node) |
-
-> **Note:** The `sky`, `native`, and `z1` platforms are explicitly excluded
-> from this project. Only the SimpleLink family is supported.
+1. The coordinator boots with `NODEID=1`, becomes the TSCH coordinator, and
+   starts the RPL root.
+2. Sensor nodes join the TSCH network and become visible in the coordinator's
+   RPL routing table.
+3. `uart_sender.py` sends an `FW:S` START command to the coordinator serial
+   port.
+4. The coordinator sends a START packet to the routed nodes.
+5. Each sensor node checks the target and image secVer:
+   - if acceptable, it replies with an accepted `PKT_TYPE_START_REPORT`;
+   - otherwise, it replies with a rejection status.
+6. The coordinator keeps only accepted nodes in the active OTA session.
+7. The script splits the firmware into 4096-byte pages and sends each page to
+   the coordinator as 32-byte UART chunks.
+8. The coordinator distributes each page as 64-byte UDP DATA packets.
+9. At the end of each page, sensor nodes send bitmap reports. If chunks are
+   missing, the coordinator retransmits only the missing chunks.
+10. After all pages are sent, the script sends `FW:V:<crc>` to trigger image
+    verification.
+11. Sensor nodes validate the image and perform the architecture-specific
+    staging/reset operation.
 
 ---
 
-## Prerequisites
+## Project Layout
 
-- **Contiki-NG** repository cloned (this example lives inside it at
-  `examples/6tisch/sn-to-hw/`)
-- **ARM GCC toolchain** (`arm-none-eabi-gcc`) installed and on `$PATH`
-- **TI SimpleLink CC13xx/CC26xx SDK** installed; SDK root path exported:
-  ```bash
-  export SIMPLELINK_CC13XX_CC26XX_SDK_INSTALL_DIR=/path/to/simplelink_cc13xx_cc26xx_sdk_x_xx_xx_xx
-  ```
-- **Uniflash** or `cc2538-bsl` for flashing (optional — only needed for
-  physical hardware)
-- **Cooja** (bundled with Contiki-NG) for simulation
-
----
-
-## Project Structure
-
-```
-sn-to-hw/
-├── node.c              # Main application — dual-role logic
-├── project-conf.h      # Project-level compile-time configuration
-├── Makefile            # Build system; convenience targets for each role
-├── rpl-tsch-cooja.csc  # Cooja simulation scenario (2 nodes pre-configured)
-└── README.md           # This file
+```text
+6tisch-firm-send/
+|-- node.c                       # Role bootstrap and Contiki process wiring
+|-- ota.h                        # OTA protocol, constants, and public API
+|-- ota-common.c                 # Shared transfer state and send_to_all()
+|-- ota-coordinator.c            # Architecture-neutral coordinator
+|-- ota-coordinator-session.c    # Coordinator session/admission helpers
+|-- ota-sensor.c                 # Common sensor-node OTA state machine
+|-- ota-sensor-backend.h         # Sensor backend interface
+|-- sensor-node-dual-onchip.c    # Dual-onchip sensor-node OTA backend
+|-- sensor-node-offchip.c        # Offchip sensor-node OTA backend
+|-- sensor-node-legacy.c         # Legacy non-BIM sensor path
+|-- coordinator-legacy.c         # Legacy non-BIM coordinator path
+|-- ota-flash.c/.h               # Dual-onchip internal flash operations
+|-- ota-metadata.c/.h            # Dual-onchip BIM metadata operations
+|-- oad_image_header_app.c/.h    # TI OAD image header integration
+|-- slot-a.ld                    # Dual-onchip Slot A linker script
+|-- slot-b.ld                    # Dual-onchip Slot B linker script
+|-- offchip-oad.ld               # Offchip linker script
+|-- uart_sender.py               # UART OTA sender
+|-- project-conf.h               # 6TiSCH, RPL, TSCH, and platform settings
+|-- Makefile                     # Build targets
+`-- rpl-tsch-cooja.csc           # Cooja scenario
 ```
 
 ---
 
-## Key Configuration Parameters
+## Requirements
 
-All tunable parameters live in [`project-conf.h`](project-conf.h).
+- Contiki-NG source tree with this example directory
+- `arm-none-eabi-gcc` toolchain
+- GNU Make (`gmake`)
+- TI SimpleLink CC13xx/CC26xx SDK
+- TI OAD image tool and private key:
+  - default SDK path: `$(HOME)/ti/simplelink_cc13xx_cc26xx_sdk_8_32_00_07`
+  - override with `TI_FULL_SDK_DIR=/path/to/sdk`
+- Python 3
+- `pyserial` for the UART sender
+- TI UniFlash, `cc2538-bsl`, or your preferred flashing tool
 
-### RF / PHY
+Default platform:
 
-| Macro | Value | Description |
-|-------|-------|-------------|
-| `RF_CONF_MODE` | `RF_MODE_2_4_GHZ` | Force 2.4 GHz IEEE mode on CC1352R1 |
-| `DOT_15_4G_CONF_FREQ_BAND_ID` | `DOT_15_4G_FREQ_BAND_2450` | 2.4 GHz band |
-| `IEEE802154_CONF_DEFAULT_CHANNEL` | `26` | Default RF channel (11–26) |
-
-### TSCH
-
-| Macro | Value | Description |
-|-------|-------|-------------|
-| `TSCH_CONF_DEFAULT_TIMESLOT_TIMING` | `tsch_timeslot_timing_us_10000` | Standard 10 ms timeslot |
-| `TSCH_CONF_ARCH_HDR_PATH` | `"net/mac/tsch/tsch.h"` | Suppresses platform 50 kbps timing override |
-| `IEEE802154_CONF_PANID` | `0x81a5` | Personal Area Network ID |
-| `TSCH_CONF_AUTOSTART` | `0` | TSCH is started manually via `NETSTACK_MAC.on()` |
-| `TSCH_SCHEDULE_CONF_DEFAULT_LENGTH` | `3` | Minimal 6TiSCH schedule slots |
-| `TSCH_CONF_DEFAULT_HOPPING_SEQUENCE` | `TSCH_HOPPING_SEQUENCE_1_1` | Single-channel hopping (ch 20) |
-| `TSCH_CONF_EB_PERIOD` | `2 * CLOCK_SECOND` | Enhanced Beacon interval — fast sync |
-| `TSCH_CONF_MAX_EB_PERIOD` | `4 * CLOCK_SECOND` | Maximum EB back-off period |
-
-### Application (node.c)
-
-| Macro | Value | Description |
-|-------|-------|-------------|
-| `UDP_PORT` | `8765` | UDP port for coordinator ↔ sensor communication |
-| `SEND_INTERVAL` | `10 * CLOCK_SECOND` | How often the sensor node sends a message |
-| `MSG_PAYLOAD` | `"Hello World!"` | Payload content of each UDP packet |
-
-### Logging
-
-| Macro | Level | Note |
-|-------|-------|------|
-| `LOG_CONF_LEVEL_RPL` | `WARN` | Suppress verbose RPL output |
-| `LOG_CONF_LEVEL_MAC` | `INFO` | Show TSCH association events |
-| `TSCH_LOG_CONF_PER_SLOT` | `1` | Enable per-slot TSCH logging |
-| `LOG_CONF_LEVEL_FRAMER` | *(not set)* | Intentionally omitted — printing from interrupt context causes hard faults on SimpleLink |
+```make
+TARGET ?= simplelink
+BOARD  ?= sensortag/cc1352r1
+```
 
 ---
 
 ## Building
 
-The default `TARGET` is `simplelink` and the default `BOARD` is
-`sensortag/cc1352r1`. Override these on the command line if needed.
+Use the convenience targets below. They pass the required `MAKE_WITH_BIM_*`,
+linker script, and `NODEID` parameters internally, so normal builds do not need
+those flags on the command line.
 
-### Coordinator (node\_id = 1)
+### Dual-onchip Sensor-Node Images
 
-```bash
-make coordinator
-# Produces: coordinator.bin
+```sh
+gmake sensor-node-slot-a APP_SEC_VER=1
+gmake sensor-node-slot-b APP_SEC_VER=2
 ```
 
-This runs `distclean` first, then builds with `NODEID=1` and copies the
-resulting ELF to `coordinator.bin`.
+Outputs:
 
-### Sensor Node (node\_id ≥ 2)
+- `sensor-node-slot-a.elf`
+- `sensor-node-slot-a-raw.bin`
+- `sensor-node-slot-a.hex`
+- `sensor-node-slot-a.bin`
+- `sensor-node-slot-b.elf`
+- `sensor-node-slot-b-raw.bin`
+- `sensor-node-slot-b.hex`
+- `sensor-node-slot-b.bin`
 
-```bash
-make sensor-node
-# Produces: sensor-node.bin
+The Slot A build also creates `sensor-node.bin` and `sensor-node.hex` copies for
+initial flashing convenience.
+
+### Offchip Sensor-Node Image
+
+```sh
+gmake sensor-node-offchip APP_SEC_VER=3
 ```
 
-This runs `distclean` first, then builds with `NODEID=2` and copies the
-resulting ELF to `sensor-node.bin`.
+Outputs:
 
-### Generic build (choose node ID manually)
+- `sensor-node-offchip.elf`
+- `sensor-node-offchip-raw.bin`
+- `sensor-node-offchip.hex`
+- `sensor-node-offchip.bin`
 
-```bash
-make NODEID=3 TARGET=simplelink BOARD=sensortag/cc1352r1
+### Dual-onchip Coordinator Images
+
+```sh
+gmake coordinator-slot-a APP_SEC_VER=4
+gmake coordinator-slot-b APP_SEC_VER=5
 ```
 
-### Build with optional features
+Use these when the coordinator itself is running under the dual-onchip BIM
+layout. The coordinator still does not interpret the target architecture of the
+image it forwards.
 
-```bash
-# Enable link-layer security (802.15.4 AES-128 CCM*)
-make coordinator MAKE_WITH_SECURITY=1
+### Offchip Coordinator Image
 
-# Enable Orchestra adaptive TSCH scheduling
-make coordinator MAKE_WITH_ORCHESTRA=1
+```sh
+gmake coordinator-offchip APP_SEC_VER=6
 ```
 
----
+Outputs:
 
-## Flashing
+- `coordinator-offchip.elf`
+- `coordinator-offchip-raw.bin`
+- `coordinator-offchip.hex`
+- `coordinator-offchip.bin`
 
-Flash coordinator firmware to the first board and sensor-node firmware to all
-remaining boards using **TI Uniflash** or the `cc2538-bsl` script:
+### Legacy Non-BIM Targets
 
-```bash
-# Example using cc2538-bsl (adjust serial port as needed)
-python3 cc2538-bsl.py -e -w -v -p /dev/tty.usbmodem* coordinator.bin
-python3 cc2538-bsl.py -e -w -v -p /dev/tty.usbmodem* sensor-node.bin
-```
+The BIM targets above are the primary OTA build path. The old non-BIM demo path
+is kept for compatibility:
 
----
-
-## Simulation with Cooja
-
-A pre-configured Cooja scenario is included:
-
-```bash
-# From the Contiki-NG root:
-cd tools/cooja
-./gradlew run --args="--contiki=../.. \
-  --logdir=/tmp/cooja-logs \
-  ../../examples/6tisch/sn-to-hw/rpl-tsch-cooja.csc"
-```
-
-The scenario contains 2 motes:
-- Mote 1 → Coordinator (`node_id = 1`)
-- Mote 2 → Sensor Node (`node_id = 2`)
-
----
-
-## Expected Log Output
-
-### Coordinator
-
-```
-[INFO: App      ] This device is COORDINATOR (node_id=1).
-[INFO: MAC      ] association done (PAN ID 0x81a5)
-[INFO: App      ] Message received [12 bytes]: Hello World!
-[INFO: App      ] Hello World! received
-[INFO: App      ] Sender: fe80::202:2:2:2
-```
-
-### Sensor Node
-
-```
-[INFO: App      ] This device is SENSOR-NODE (node_id=2). Connecting to coordinator...
-[INFO: App      ] Waiting for TSCH synchronization and RPL DODAG...
-[INFO: MAC      ] association done (PAN ID 0x81a5)
-[INFO: App      ] Coordinator root address found: fd00::201:1:1:1
-[INFO: App      ] Sending to coordinator -> fd00::201:1:1:1 : "Hello World!" [1]
-[INFO: App      ] Sending to coordinator -> fd00::201:1:1:1 : "Hello World!" [2]
+```sh
+gmake coordinator
+gmake sensor-node
 ```
 
 ---
 
-## Timing Behaviour
+## Initial Flashing
 
-Understanding the startup sequence is important for debugging:
+Initial flashing depends on the BIM layout.
 
-```
-t=0s   Node boots, TSCH MAC starts
-t≈2s   Enhanced Beacon received from coordinator → TSCH association
-t≈4s   RPL DODAG discovered, root IPv6 address known
-         → "Coordinator root address found" logged
-t≈4s   10-second send timer is armed (etimer_set)
-t≈14s  First "Hello World!" sent to coordinator
-t≈24s  Second "Hello World!" sent ...  (every 10 s thereafter)
-```
+### Dual-onchip
 
-> **Why the 10-second gap before the first message?**
->
-> The timer is set immediately after the root address is discovered, so the
-> first message is sent exactly one `SEND_INTERVAL` (10 s) later. This is by
-> design: it gives the RPL routes time to fully stabilise before application
-> traffic starts. To send immediately on first discovery, add a
-> `simple_udp_sendto()` call before `etimer_set()`.
+1. Flash the dual-onchip BIM.
+2. Build and flash the Slot A coordinator application:
+
+   ```sh
+   gmake coordinator-slot-a APP_SEC_VER=1
+   ```
+
+3. Build and flash the Slot A sensor-node application:
+
+   ```sh
+   gmake sensor-node-slot-a APP_SEC_VER=1
+   ```
+
+4. For later OTA updates, target the inactive slot. A typical first update for
+   a node currently running Slot A is a Slot B image.
+
+### Offchip
+
+1. Flash the offchip BIM.
+2. Build and flash the offchip coordinator application:
+
+   ```sh
+   gmake coordinator-offchip APP_SEC_VER=1
+   ```
+
+3. Build and flash the offchip sensor-node application:
+
+   ```sh
+   gmake sensor-node-offchip APP_SEC_VER=1
+   ```
+
+In the offchip flow, the application runs from internal flash, the OTA
+candidate is written to external flash, and BIM evaluates the candidate after
+reset.
 
 ---
 
-## Optional Build Flags
+## Sending OTA Images over UART
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `MAKE_WITH_ORCHESTRA` | `0` | Enable Orchestra adaptive scheduling |
-| `MAKE_WITH_SECURITY` | `0` | Enable IEEE 802.15.4 link-layer security |
-| `MAKE_WITH_STORING_ROUTING` | `0` | Switch RPL to storing mode |
-| `MAKE_WITH_LINK_BASED_ORCHESTRA` | `0` | Use link-based Orchestra rule (requires storing mode) |
-| `MAKE_WITH_ORCHESTRA_ROOT_RULE` | `0` | Add a dedicated root scheduling rule |
-| `MAKE_WITH_PERIODIC_ROUTES_PRINT` | `0` | Periodically print routing table (regression tests) |
+Usage:
+
+```sh
+python3 uart_sender.py <serial_port> <firmware.bin> <image_sec_ver> [target]
+```
+
+Parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `<serial_port>` | Coordinator serial port |
+| `<firmware.bin>` | OAD binary to send |
+| `<image_sec_ver>` | Security version of the image being sent |
+| `[target]` | `A`, `B`, or `offchip`. Defaults to `offchip` if omitted |
+
+Examples:
+
+```sh
+python3 uart_sender.py /dev/tty.usbmodem00000001 sensor-node-slot-b.bin 2 B
+python3 uart_sender.py /dev/tty.usbmodem00000001 sensor-node-slot-a.bin 3 A
+python3 uart_sender.py /dev/tty.usbmodem00000001 sensor-node-offchip.bin 4 offchip
+```
+
+`image_sec_ver` is required for all architectures. It is also required for
+dual-onchip images so sensor nodes can reject lower or equal secVer images
+during START admission, before DATA transfer begins.
+
+The script clears `coordinator.log` at the start of each session and appends the
+serial logs it reads from the coordinator.
+
+---
+
+## Protocol Summary
+
+UART commands between `uart_sender.py` and the coordinator:
+
+| Command | Direction | Meaning |
+|---------|-----------|---------|
+| `FW:S:<size>:<secVer>:<target>` | Script -> Coordinator | Start a new OTA session |
+| `FW:D:<offset>:<len>:<hex>` | Script -> Coordinator | Write a firmware chunk into the coordinator page buffer |
+| `FW:V:<crc16>` | Script -> Coordinator | Verify the full image |
+| `FW:ACK` | Coordinator -> Script | Command accepted, or START admission completed |
+| `FW:NO_TARGETS` | Coordinator -> Script | No eligible target nodes remain |
+| `FW:PAGE_OK` | Coordinator -> Script | Current page was distributed to all active nodes |
+
+UDP packet types are defined in `ota.h`:
+
+| Packet | Value | Purpose |
+|--------|-------|---------|
+| `PKT_TYPE_START` | `0` | Starts sensor-node admission checks |
+| `PKT_TYPE_DATA` | `1` | Carries firmware data |
+| `PKT_TYPE_VERIFY` | `2` | Triggers full-image CRC validation and staging |
+| `PKT_TYPE_BITMAP_REPORT` | `3` | Sensor-node page bitmap report |
+| `PKT_TYPE_PAGE_END` | `4` | Coordinator page-end report request |
+| `PKT_TYPE_START_REPORT` | `5` | Sensor-node START accept/reject report |
+
+Target constants:
+
+| Target | Value |
+|--------|-------|
+| `OTA_SLOT_A` | `0` |
+| `OTA_SLOT_B` | `1` |
+| `OTA_TARGET_OFFCHIP` | `0x80` |
+
+---
+
+## Admission and Rejection Rules
+
+The coordinator does not filter images by architecture. This is intentional:
+the coordinator can forward `A`, `B`, or `offchip` targets regardless of its own
+BIM layout.
+
+Expected sensor-node behavior:
+
+| Sensor-node backend | Accepted targets | Rejected targets |
+|---------------------|------------------|------------------|
+| `sensor-node-dual-onchip.c` | `A`, `B` | `offchip`, invalid target, active slot, lower/equal secVer |
+| `sensor-node-offchip.c` | `offchip` | `A`, `B`, invalid target, lower/equal secVer |
+
+START status codes:
+
+| Status | Meaning |
+|--------|---------|
+| `OTA_START_STATUS_ACCEPTED` | Sensor node is ready to receive the image |
+| `OTA_START_STATUS_REJECTED_VERSION` | Image secVer policy failed |
+| `OTA_START_STATUS_REJECTED_TARGET` | Target is not valid for this sensor-node backend |
+| `OTA_START_STATUS_REJECTED_SAME_SLOT` | Dual-onchip node refused to write to its active slot |
+
+At the end of START admission, the coordinator removes rejected and silent nodes
+from the active session. If no nodes remain, it returns `FW:NO_TARGETS` to the
+UART script.
+
+---
+
+## Important Configuration
+
+Main settings in `project-conf.h`:
+
+| Setting | Value | Note |
+|---------|-------|------|
+| `RF_CONF_MODE` | `RF_MODE_2_4_GHZ` | 2.4 GHz IEEE mode for CC1352R1 |
+| `IEEE802154_CONF_DEFAULT_CHANNEL` | `26` | Default 802.15.4 channel |
+| `IEEE802154_CONF_PANID` | `0x81a5` | TSCH PAN ID |
+| `TSCH_CONF_AUTOSTART` | `0` | TSCH is started with `NETSTACK_MAC.on()` |
+| `TSCH_CONF_EB_PERIOD` | `2 * CLOCK_SECOND` | Faster association |
+| `TSCH_CONF_MAX_EB_PERIOD` | `4 * CLOCK_SECOND` | EB backoff upper bound |
+| `ORCHESTRA_CONF_UNICAST_PERIOD` | `7` | Faster unicast slots for OTA transfer |
+| `TSCH_QUEUE_CONF_NUM_PER_NEIGHBOR` | `16` | Larger neighbor queue for OTA traffic |
+| `QUEUEBUF_CONF_NUM` | `16` | Queuebuf capacity |
+
+Important Makefile variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APP_SEC_VER` | `1` | OAD image security version |
+| `APP_IMG_NO` | `0` | OAD image number |
+| `APP_V_MAJOR/MINOR/PATCH/BUILD` | `1.0.0.0` | OAD software version fields |
+| `TI_FULL_SDK_DIR` | `$(HOME)/ti/simplelink_cc13xx_cc26xx_sdk_8_32_00_07` | TI SDK path |
+| `OAD_IMAGE_TOOL` | SDK OAD tool path | TI OAD binary generation |
+| `OAD_PRIVATE_KEY` | SDK `private.pem` path | OAD signing key |
+| `OTA_EXPECTED_IMG_TYPE` | `OAD_IMG_TYPE_APP` | Offchip image type validation |
+| `OTA_STAGE_RESET_AFTER_VERIFY` | `1` | Offchip reset staging after VERIFY |
+
+---
+
+## Logs and Verification
+
+Typical coordinator readiness log:
+
+```text
+[INFO: App] This device is COORDINATOR (node_id=1).
+[INFO: App] Waiting for TSCH association and first sensor-node route...
+[INFO: App] Routes detected. Ready to receive firmware via UART.
+```
+
+START admission:
+
+```text
+[INFO: App] Session admission started for 1 routed nodes:
+[INFO: App] Sent START, size: ..., secVer: ..., target: B
+[INFO: App] START report from ...: status=0 imageSecVer=2 runningSecVer=1
+[INFO: App] START admission complete: accepted=1 rejected=0 silent=0
+```
+
+Page distribution:
+
+```text
+[INFO: App] Distributing page at offset 0x00000, total chunks: ...
+[INFO: App] Sent PAGE_END for offset 0x00000, waiting for bitmap...
+[INFO: App] Page 0x00000 successfully completed on all active nodes!
+FW:PAGE_OK
+```
+
+Rejection example:
+
+```text
+[INFO: App] START report from ...: status=2 imageSecVer=... runningSecVer=...
+[INFO: App] START admission dropped rejected node: ...
+FW:NO_TARGETS
+```
+
+Build verification commands:
+
+```sh
+python3 -m py_compile uart_sender.py
+gmake sensor-node-slot-a APP_SEC_VER=1
+gmake sensor-node-slot-b APP_SEC_VER=2
+gmake sensor-node-offchip APP_SEC_VER=3
+gmake coordinator-slot-a APP_SEC_VER=4
+gmake coordinator-slot-b APP_SEC_VER=5
+gmake coordinator-offchip APP_SEC_VER=6
+```
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Likely Cause | Fix |
-|---------|-------------|-----|
-| Sensor node never associates | RF channel mismatch | Ensure both boards use the same `IEEE802154_CONF_DEFAULT_CHANNEL` |
-| Build fails with `tsch-arch.h` errors | Platform timing header conflict | Verify `TSCH_CONF_ARCH_HDR_PATH` is set to `"net/mac/tsch/tsch.h"` |
-| Hard fault / crash on coordinator | `LOG_CONF_LEVEL_FRAMER` defined | Remove `FRAMER` log level — it triggers interrupt-context printing on SimpleLink |
-| No messages received by coordinator | RPL not converged | Wait longer; check `LOG_CONF_LEVEL_RPL` is at least `WARN` to see routing events |
-| `Binary not found` after `make coordinator` | Build error silently failed | Run plain `make` first to see full compiler output |
+| Symptom | Likely cause | Check / fix |
+|---------|--------------|-------------|
+| Script receives `FW:NO_TARGETS` | No routed nodes, or all nodes rejected START | Check coordinator route logs and START status codes |
+| Dual-onchip node appears to accept `offchip` | Old firmware is running, or wrong binary was flashed | Rebuild/flash `sensor-node-slot-a` or `sensor-node-slot-b` and check backend logs |
+| Offchip node appears to accept `A`/`B` | Old offchip firmware without target checks may be running | Rebuild/flash `sensor-node-offchip` |
+| START admission times out | Nodes are routed but do not reply | Check TSCH association, RPL routes, and `coordinator.log` |
+| DATA chunk is rejected | DATA arrived before START admission finished, or no active targets remain | Ensure the script waits for `FW:ACK` after START |
+| Page timeout | Bitmap reports are missing or packet loss is high | Check RSSI/distance, TSCH queues, and route stability |
+| `secVer <= running secVer` appears in logs | The sent image is not newer | Increase `APP_SEC_VER` and rebuild |
+| Same-slot rejection | Dual-onchip node refused to write to its active slot | If running Slot A, target `B`; if running Slot B, target `A` |
+| Build fails around OAD image tool | SDK path or private key path is wrong | Check `TI_FULL_SDK_DIR`, `OAD_IMAGE_TOOL`, and `OAD_PRIVATE_KEY` |
+| SimpleLink hard fault | Interrupt-context logging or platform log level issue | Keep `LOG_CONF_LEVEL_FRAMER` undefined |
 
 ---
 
-## License
+## Notes
 
-This project is derived from the Contiki-NG 6TiSCH example by
-[Simon Duquennoy](mailto:simonduq@sics.se) (SICS Swedish ICT) and is
-distributed under the **3-Clause BSD License**. See the file headers for the
-full license text.
+- Sensor-node builds intentionally do not pass `NODEID`. The same binary can be
+  flashed to multiple physical nodes; each device uses its hardware EUI-64
+  address.
+- Coordinator builds pass `NODEID=1`. The RPL root startup decision in `node.c`
+  depends on this value.
+- `MAKE_WITH_BIM_DUAL_ONCHIP` and `MAKE_WITH_BIM_OFFCHIP` are mutually
+  exclusive. The Makefile stops with an error if both are enabled.
+- The primary OTA source files are `ota-coordinator.c`,
+  `ota-coordinator-session.c`, `ota-sensor.c`,
+  `sensor-node-dual-onchip.c`, and `sensor-node-offchip.c`.
+  `coordinator-legacy.c` and `sensor-node-legacy.c` are kept only for the
+  legacy non-BIM path.

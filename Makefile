@@ -27,12 +27,15 @@ OTA_STAGE_RESET_AFTER_VERIFY ?= 1
 MODULES += $(CONTIKI_NG_SERVICES_DIR)/simple-energest
 PROJECT_SOURCEFILES += ota-common.c
 
+# OTA/BIM builds share one coordinator and select only the sensor-node backend
+# that matches the requested BIM architecture. The coordinator is intentionally
+# target-agnostic; START admission on sensor nodes accepts or rejects the image.
 ifeq ($(MAKE_WITH_BIM_DUAL_ONCHIP),1)
   ifeq ($(MAKE_WITH_BIM_OFFCHIP),1)
     $(error MAKE_WITH_BIM_DUAL_ONCHIP and MAKE_WITH_BIM_OFFCHIP are mutually exclusive)
   endif
-  PROJECT_SOURCEFILES += ota-coordinator-common.c
-  PROJECT_SOURCEFILES += coordinator-dual-onchip.c sensor-node-dual-onchip.c
+  PROJECT_SOURCEFILES += ota-coordinator-session.c
+  PROJECT_SOURCEFILES += ota-coordinator.c ota-sensor.c sensor-node-dual-onchip.c
   PROJECT_SOURCEFILES += oad_image_header_app.c ota-flash.c ota-metadata.c
   CFLAGS += -DOTA_WITH_BIM_DUAL_ONCHIP=1
   CFLAGS += -DSECURITY
@@ -47,8 +50,8 @@ ifeq ($(MAKE_WITH_BIM_DUAL_ONCHIP),1)
   CFLAGS += -idirafter $(TI_FULL_SDK_DIR)/source
 else ifeq ($(MAKE_WITH_BIM_OFFCHIP),1)
   MODULES += arch/dev/storage/ext-flash
-  PROJECT_SOURCEFILES += ota-coordinator-common.c
-  PROJECT_SOURCEFILES += coordinator-offchip.c sensor-node-offchip.c
+  PROJECT_SOURCEFILES += ota-coordinator-session.c
+  PROJECT_SOURCEFILES += ota-coordinator.c ota-sensor.c sensor-node-offchip.c
   PROJECT_SOURCEFILES += oad_image_header_app.c
   CFLAGS += -DOTA_WITH_BIM_OFFCHIP=1
   CFLAGS += -DOAD_IMG_TYPE=$(OAD_IMG_TYPE)
@@ -65,8 +68,9 @@ else ifeq ($(MAKE_WITH_BIM_OFFCHIP),1)
   CFLAGS += -I.
   CFLAGS += -idirafter $(TI_FULL_SDK_DIR)/source
 else
+  # Legacy non-BIM demo path kept for the original single-binary example.
   MODULES += arch/dev/storage/ext-flash
-  PROJECT_SOURCEFILES += coordinator.c sensor-node.c
+  PROJECT_SOURCEFILES += coordinator-legacy.c sensor-node-legacy.c
 endif
 
 ifdef SOURCE_LDSCRIPT

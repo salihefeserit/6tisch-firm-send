@@ -32,14 +32,8 @@ PROCESS_THREAD(node_process, ev, data) {
     LOG_INFO(
         "This device is SENSOR-NODE (node_id=%u). Waiting for coordinator...\n",
         node_id);
-#if OTA_WITH_BIM_DUAL_ONCHIP
+#if OTA_WITH_BIM_DUAL_ONCHIP || OTA_WITH_BIM_OFFCHIP
     ota_sensor_boot_check();
-#elif OTA_WITH_BIM_OFFCHIP
-    LOG_INFO("[OTA] Running secVer=%u, off-chip payload base=0x%05lx, "
-             "BIM metadata base=0x%05lx\n",
-             OTA_RUNNING_SEC_VER,
-             (unsigned long)OTA_EXT_IMAGE_ADDR,
-             (unsigned long)OTA_EXT_METADATA_ADDR);
 #endif
   }
 
@@ -86,13 +80,13 @@ PROCESS_THREAD(node_process, ev, data) {
   }
 
   /* Sensor-node: keep the process alive. */
-#if OTA_WITH_BIM_DUAL_ONCHIP
+#if OTA_WITH_BIM_DUAL_ONCHIP || OTA_WITH_BIM_OFFCHIP
   static struct etimer stability_timer;
   etimer_set(&stability_timer, CLOCK_SECOND * 30);
 #endif
   while (1) {
     PROCESS_WAIT_EVENT();
-#if OTA_WITH_BIM_DUAL_ONCHIP
+#if OTA_WITH_BIM_DUAL_ONCHIP || OTA_WITH_BIM_OFFCHIP
     if (ev == PROCESS_EVENT_TIMER && data == &stability_timer) {
       ota_sensor_confirm_stable();
     }

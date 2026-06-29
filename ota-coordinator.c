@@ -5,6 +5,12 @@
 #include "net/ipv6/uip-ds6.h"
 #include "ota.h"
 
+/*
+ * Architecture-neutral OTA coordinator.
+ *
+ * The coordinator only forwards the target selected by UART. Dual-onchip vs
+ * offchip compatibility is decided by each sensor node during START admission.
+ */
 PROCESS(distribute_process, "OTA Distribution Process");
 
 /* Process thread for distributing a page to all nodes */
@@ -19,13 +25,6 @@ PROCESS_THREAD(distribute_process, ev, data) {
   PROCESS_BEGIN();
 
   total_chunks = (expected_page_size + 63) / 64;
-  LOG_INFO("DEBUG crc16_add('1', 0) = 0x%04x\n", crc16_add('1', 0));
-  LOG_INFO("DEBUG crc16_add(0xef, 0) = 0x%04x\n", crc16_add(0xef, 0));
-  LOG_INFO("Page Buffer Header: ");
-  for(int i = 0; i < 16 && i < expected_page_size; i++) {
-    printf("%02x", page_buffer[i]);
-  }
-  printf("\n");
   page_crc = crc16_data(page_buffer, expected_page_size, 0);
   LOG_INFO("Distributing page at offset 0x%05lx, total chunks: %u, CRC-16: 0x%04x\n",
            (unsigned long)page_start_offset, total_chunks, page_crc);

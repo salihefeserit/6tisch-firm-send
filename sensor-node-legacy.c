@@ -5,6 +5,7 @@
 #include "net/ipv6/uip-ds6-route.h"
 #include "ota.h"
 #include "sys/log.h"
+#include "ext-flash.h"
 
 /* Coordinator IP variables are no longer needed globally as they are derived
  * from RPL root IP */
