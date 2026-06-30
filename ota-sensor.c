@@ -245,6 +245,7 @@ handle_data(const fw_packet_t *pkt, uint16_t datalen, uint8_t should_forward)
 {
   uint32_t page_offset;
   uint32_t sector_offset;
+  uint32_t erase_sector_size;
   uint16_t chunk_idx;
   uint8_t chunk_already_received = 0;
 
@@ -263,7 +264,8 @@ handle_data(const fw_packet_t *pkt, uint16_t datalen, uint8_t should_forward)
   }
 
   page_offset = pkt->offset - (pkt->offset % PAGE_SIZE);
-  sector_offset = pkt->offset - (pkt->offset % OTA_FLASH_ERASE_SECTOR_SIZE);
+  erase_sector_size = ota_sensor_backend_erase_sector_size();
+  sector_offset = pkt->offset - (pkt->offset % erase_sector_size);
 
   if(current_rx_page_offset == 0xFFFFFFFFUL) {
     current_rx_page_offset = page_offset;

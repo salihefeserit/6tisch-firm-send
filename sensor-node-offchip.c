@@ -26,6 +26,12 @@ ota_sensor_backend_running_sec_ver(void)
   return OTA_RUNNING_SEC_VER;
 }
 
+uint32_t
+ota_sensor_backend_erase_sector_size(void)
+{
+  return EXT_FLASH_ERASE_SECTOR_SIZE;
+}
+
 static uint32_t
 image_softver_to_u32(const imgFixedHdr_t *fixed_hdr)
 {

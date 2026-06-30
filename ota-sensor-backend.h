@@ -5,6 +5,7 @@
 
 const char *ota_sensor_backend_target_name(uint8_t target);
 uint16_t ota_sensor_backend_running_sec_ver(void);
+uint32_t ota_sensor_backend_erase_sector_size(void);
 uint8_t ota_sensor_backend_start(uint8_t target, uint32_t file_size,
                                  uint16_t image_sec_ver,
                                  uint8_t *reject_status);

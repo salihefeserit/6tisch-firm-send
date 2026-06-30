@@ -36,6 +36,12 @@ ota_sensor_backend_running_sec_ver(void)
   return ota_image_header.secInfoSeg.secVer;
 }
 
+uint32_t
+ota_sensor_backend_erase_sector_size(void)
+{
+  return OTA_FLASH_ERASE_SECTOR_SIZE;
+}
+
 static uint32_t
 image_softver_to_u32(const uint8_t soft_ver[4])
 {
