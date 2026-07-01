@@ -17,5 +17,6 @@ uint8_t ota_sensor_backend_write(uint8_t target, uint32_t offset,
 uint8_t ota_sensor_backend_read(uint8_t target, uint32_t offset,
                                 uint16_t length, uint8_t *buf);
 uint8_t ota_sensor_backend_stage(uint8_t target);
+void ota_sensor_backend_reset_to_staged_image(void);
 
 #endif /* OTA_SENSOR_BACKEND_H_ */

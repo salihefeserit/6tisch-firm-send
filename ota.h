@@ -40,6 +40,7 @@
 #define PKT_TYPE_BITMAP_REPORT 3
 #define PKT_TYPE_PAGE_END 4
 #define PKT_TYPE_START_REPORT 5
+#define PKT_TYPE_STAGE_REPORT 6
 
 /* PAGE/bitmap report status values. */
 #define OTA_REPORT_STATUS_OK 0
@@ -50,6 +51,21 @@
 #define OTA_START_STATUS_REJECTED_VERSION 1
 #define OTA_START_STATUS_REJECTED_TARGET 2
 #define OTA_START_STATUS_REJECTED_SAME_SLOT 3
+
+/* Stage/reboot status values. */
+#define OTA_STAGE_STATUS_STAGED 0
+#define OTA_STAGE_STATUS_REBOOTING_SOON 1
+#define OTA_STAGE_STATUS_STAGE_FAILED 2
+
+#ifndef OTA_STAGE_RESET_AFTER_VERIFY
+#define OTA_STAGE_RESET_AFTER_VERIFY 1
+#endif
+#ifndef OTA_STAGE_LEAF_STABILITY_SECONDS
+#define OTA_STAGE_LEAF_STABILITY_SECONDS 5
+#endif
+#ifndef OTA_STAGE_REBOOT_DELAY_SECONDS
+#define OTA_STAGE_REBOOT_DELAY_SECONDS 2
+#endif
 
 /* Architecture-neutral target identifiers carried in fw_packet_t.target_slot. */
 #ifndef OTA_SLOT_A
@@ -115,6 +131,15 @@ typedef struct __attribute__((packed)) {
   uint16_t running_sec_ver;
   uint8_t target_slot;
 } start_report_t;
+
+typedef struct __attribute__((packed)) {
+  uint8_t type; /* PKT_TYPE_STAGE_REPORT */
+  uint8_t status;
+  uint8_t target_slot;
+  uint16_t image_sec_ver;
+  uint16_t running_sec_ver;
+  uint8_t is_leaf;
+} stage_report_t;
 
 /* -------------------------------------------------------------------------- */
 /* Shared transfer state                                                       */

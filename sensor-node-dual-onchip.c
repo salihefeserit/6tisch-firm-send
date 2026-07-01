@@ -15,7 +15,6 @@
 
 static ota_boot_metadata_t current_metadata;
 static uint8_t current_slot = OTA_SLOT_INVALID;
-static struct ctimer ota_reset_timer;
 static uint8_t rejected_same_slot = 0;
 
 static char
@@ -48,14 +47,6 @@ image_softver_to_u32(const uint8_t soft_ver[4])
   uint32_t version;
   memcpy(&version, soft_ver, sizeof(version));
   return version;
-}
-
-static void
-ota_reset_callback(void *ptr)
-{
-  (void)ptr;
-  LOG_INFO("[OTA] Resetting to boot staged image\n");
-  SysCtrlSystemReset();
 }
 
 static int
@@ -163,10 +154,15 @@ ota_sensor_backend_stage(uint8_t target)
   }
 
   current_metadata = metadata;
-  LOG_INFO("[OTA] Slot %c staged. Reset scheduled in 5 seconds.\n",
-           slot_char(target));
-  ctimer_set(&ota_reset_timer, 5 * CLOCK_SECOND, ota_reset_callback, NULL);
+  LOG_INFO("[OTA] Slot %c staged\n", slot_char(target));
   return 1;
+}
+
+void
+ota_sensor_backend_reset_to_staged_image(void)
+{
+  LOG_INFO("[OTA] Resetting to boot staged image\n");
+  SysCtrlSystemReset();
 }
 
 uint8_t

@@ -9,8 +9,6 @@
 #include <ti/common/cc26xx/oad/ext_flash_layout.h>
 #include <ti/common/cc26xx/oad/oad_image_header.h>
 
-static struct ctimer ota_reset_timer;
-
 static const uint8_t expected_img_id[OAD_IMG_ID_LEN] = OAD_IMG_ID_VAL;
 static const uint8_t expected_metadata_id[OAD_IMG_ID_LEN] = OAD_EXTFL_ID_VAL;
 
@@ -206,14 +204,6 @@ done:
   return ok;
 }
 
-static void
-ota_reset_callback(void *ptr)
-{
-  (void)ptr;
-  LOG_INFO("[OTA] Resetting to boot staged image\n");
-  SysCtrlSystemReset();
-}
-
 uint8_t
 ota_sensor_backend_stage(uint8_t target)
 {
@@ -231,15 +221,15 @@ ota_sensor_backend_stage(uint8_t target)
     return 0;
   }
 
-#if OTA_STAGE_RESET_AFTER_VERIFY
-  LOG_INFO("[OTA] Reset scheduled in 5 seconds\n");
-  ctimer_set(&ota_reset_timer, 5 * CLOCK_SECOND, ota_reset_callback, NULL);
-#else
-  LOG_INFO("[OTA] Staged image metadata written; reset disabled by "
-           "OTA_STAGE_RESET_AFTER_VERIFY=0\n");
-#endif
-
+  LOG_INFO("[OTA] Staged image metadata written\n");
   return 1;
+}
+
+void
+ota_sensor_backend_reset_to_staged_image(void)
+{
+  LOG_INFO("[OTA] Resetting to boot staged image\n");
+  SysCtrlSystemReset();
 }
 
 uint8_t

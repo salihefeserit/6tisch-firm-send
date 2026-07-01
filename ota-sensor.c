@@ -13,9 +13,20 @@ static uint8_t page_bitmap[8];
 static uint8_t page_0_erased = 0;
 static uint8_t ota_session_active = 0;
 static uint16_t running_fw_crc = 0;
+static uint16_t current_image_sec_ver = OTA_START_SEC_VER_UNKNOWN;
 
 static struct ctimer report_ctimer;
 static bitmap_report_t report_to_send;
+static struct ctimer leaf_stability_ctimer;
+static struct ctimer staged_reboot_ctimer;
+static uint16_t staged_image_sec_ver;
+static uint8_t staged_target = OTA_TARGET_INVALID;
+
+static uint8_t
+is_leaf_node(void)
+{
+  return uip_ds6_route_head() == NULL;
+}
 
 static int
 get_coordinator_ll_ip(uip_ipaddr_t *ip)
@@ -59,6 +70,98 @@ send_to_coordinator(const void *payload, uint16_t len)
   } else {
     simple_udp_sendto(&udp_conn, payload, len, &root_ip);
   }
+}
+
+static uint8_t
+parent_is_coordinator(const uip_ipaddr_t *parent_ip)
+{
+  uip_ipaddr_t coordinator_ll_ip;
+
+  return parent_ip != NULL &&
+         get_coordinator_ll_ip(&coordinator_ll_ip) &&
+         uip_ipaddr_cmp(parent_ip, &coordinator_ll_ip);
+}
+
+static void
+send_rebooting_soon_to_parent(void)
+{
+  const uip_ipaddr_t *parent_ip = uip_ds6_defrt_choose();
+  stage_report_t report;
+
+  if(parent_ip == NULL) {
+    LOG_WARN("[OTA] Cannot send REBOOTING_SOON: no parent route\n");
+    return;
+  }
+
+  if(parent_is_coordinator(parent_ip)) {
+    LOG_INFO("[OTA] Parent is coordinator; REBOOTING_SOON report skipped\n");
+    return;
+  }
+
+  memset(&report, 0, sizeof(report));
+  report.type = PKT_TYPE_STAGE_REPORT;
+  report.status = OTA_STAGE_STATUS_REBOOTING_SOON;
+  report.target_slot = staged_target;
+  report.image_sec_ver = staged_image_sec_ver;
+  report.running_sec_ver = ota_sensor_backend_running_sec_ver();
+  report.is_leaf = is_leaf_node();
+
+  simple_udp_sendto(&udp_conn, &report, sizeof(report), parent_ip);
+
+  LOG_INFO("[OTA] REBOOTING_SOON report sent to parent: ");
+  LOG_INFO_6ADDR(parent_ip);
+  LOG_INFO_("\n");
+}
+
+static void
+staged_reboot_callback(void *ptr)
+{
+  (void)ptr;
+  ota_sensor_backend_reset_to_staged_image();
+}
+
+static void
+leaf_stability_callback(void *ptr)
+{
+  (void)ptr;
+
+  if(!is_leaf_node()) {
+    LOG_INFO("[OTA] Node is no longer leaf; staged image waits for "
+             "coordinated reboot\n");
+    return;
+  }
+
+#if OTA_STAGE_RESET_AFTER_VERIFY
+  send_rebooting_soon_to_parent();
+  LOG_INFO("[OTA] Leaf remained stable. Reset scheduled in %u seconds\n",
+           OTA_STAGE_REBOOT_DELAY_SECONDS);
+  ctimer_set(&staged_reboot_ctimer,
+             OTA_STAGE_REBOOT_DELAY_SECONDS * CLOCK_SECOND,
+             staged_reboot_callback, NULL);
+#else
+  LOG_INFO("[OTA] Leaf remained stable; reset disabled by "
+           "OTA_STAGE_RESET_AFTER_VERIFY=0\n");
+#endif
+}
+
+static void
+schedule_leaf_reboot_if_safe(uint16_t image_sec_ver, uint8_t target)
+{
+  staged_image_sec_ver = image_sec_ver;
+  staged_target = target;
+
+  if(!is_leaf_node()) {
+    LOG_INFO("[OTA] Image staged on non-leaf node; waiting for downstream "
+             "reboot policy\n");
+    return;
+  }
+
+  LOG_INFO("[OTA] Image staged on leaf node. Rechecking leaf state in %u "
+           "seconds\n",
+           OTA_STAGE_LEAF_STABILITY_SECONDS);
+  ctimer_set(&leaf_stability_ctimer,
+             OTA_STAGE_LEAF_STABILITY_SECONDS * CLOCK_SECOND,
+             leaf_stability_callback, NULL);
 }
 
 static void
@@ -122,12 +225,30 @@ send_page_report(void)
 }
 
 static void
+handle_stage_report(const stage_report_t *report,
+                    const uip_ipaddr_t *sender_addr)
+{
+  LOG_INFO("[OTA] Stage report from ");
+  LOG_INFO_6ADDR(sender_addr);
+  LOG_INFO_(" status=%u imageSecVer=%u runningSecVer=%u target=%s "
+            "isLeaf=%u\n",
+            report->status, report->image_sec_ver, report->running_sec_ver,
+            ota_sensor_backend_target_name(report->target_slot),
+            report->is_leaf);
+}
+
+static void
 handle_coordinator_report(const uint8_t *data, uint16_t datalen,
                           const uip_ipaddr_t *sender_addr)
 {
   if(datalen >= sizeof(start_report_t) && data[0] == PKT_TYPE_START_REPORT) {
     ota_coordinator_handle_start_report((const start_report_t *)data,
                                         sender_addr);
+    return;
+  }
+
+  if(datalen >= sizeof(stage_report_t) && data[0] == PKT_TYPE_STAGE_REPORT) {
+    handle_stage_report((const stage_report_t *)data, sender_addr);
     return;
   }
 
@@ -194,7 +315,7 @@ packet_should_forward(const uip_ipaddr_t *sender_addr)
   uint8_t is_from_coordinator =
       (get_coordinator_ll_ip(&coordinator_ll_ip) &&
        uip_ipaddr_cmp(sender_addr, &coordinator_ll_ip));
-  uint8_t is_leaf = (uip_ds6_route_head() == NULL);
+  uint8_t is_leaf = is_leaf_node();
 
   return (is_from_parent || is_from_coordinator) && !is_leaf;
 }
@@ -224,6 +345,7 @@ handle_start(const fw_packet_t *pkt, uint16_t datalen, uint8_t should_forward)
 
   current_file_size = pkt->offset;
   ota_target_slot = pkt->target_slot;
+  current_image_sec_ver = image_sec_ver;
   ota_session_active = 0;
   reset_rx_state();
 
@@ -418,6 +540,8 @@ handle_verify(const fw_packet_t *pkt, uint16_t datalen, uint8_t should_forward)
              running_fw_crc);
     if(!ota_sensor_backend_stage(ota_target_slot)) {
       LOG_WARN("[OTA] Downloaded image was not staged for boot\n");
+    } else {
+      schedule_leaf_reboot_if_safe(current_image_sec_ver, ota_target_slot);
     }
     ota_session_active = 0;
   } else {
@@ -443,6 +567,11 @@ udp_rx_callback(struct simple_udp_connection *c,
 
   if(node_id == 1) {
     handle_coordinator_report(data, datalen, sender_addr);
+    return;
+  }
+
+  if(datalen >= sizeof(stage_report_t) && data[0] == PKT_TYPE_STAGE_REPORT) {
+    handle_stage_report((const stage_report_t *)data, sender_addr);
     return;
   }
 
