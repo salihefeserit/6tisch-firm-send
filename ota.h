@@ -84,6 +84,38 @@
 #define PAGE_SIZE 4096
 
 /* -------------------------------------------------------------------------- */
+/* OTA pacing                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * These defaults are intentionally conservative for a multi-hop line
+ * topology. Each intermediate node forwards every OTA packet, so the sender
+ * must leave enough time for the packet pipeline to drain before injecting the
+ * next chunk.
+ */
+#ifndef OTA_DISTRIBUTION_INTERVAL_MS
+#define OTA_DISTRIBUTION_INTERVAL_MS 400
+#endif
+#ifndef OTA_RECOVERY_INTERVAL_MS
+#define OTA_RECOVERY_INTERVAL_MS 600
+#endif
+#ifndef OTA_PAGE_REPORT_TIMEOUT_SECONDS
+#define OTA_PAGE_REPORT_TIMEOUT_SECONDS 20
+#endif
+#ifndef OTA_MAX_PAGE_RECOVERY_ROUNDS
+#define OTA_MAX_PAGE_RECOVERY_ROUNDS 10
+#endif
+#ifndef OTA_QUEUE_MAX_NEXT_HOP_PENDING
+#define OTA_QUEUE_MAX_NEXT_HOP_PENDING 1
+#endif
+#ifndef OTA_QUEUE_MAX_GLOBAL_PENDING
+#define OTA_QUEUE_MAX_GLOBAL_PENDING 8
+#endif
+#ifndef OTA_QUEUE_DRAIN_CHECK_MS
+#define OTA_QUEUE_DRAIN_CHECK_MS 100
+#endif
+
+/* -------------------------------------------------------------------------- */
 /* Flash layout                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -163,6 +195,8 @@ extern uint8_t retry_count;
 
 uint8_t hex2val(char c);
 void send_to_all(const fw_packet_t *pkt, uint16_t len);
+uint8_t ota_downstream_queue_ready(void);
+void ota_log_downstream_queue_state(void);
 
 PROCESS_NAME(distribute_process);
 extern process_event_t event_bitmap_received;

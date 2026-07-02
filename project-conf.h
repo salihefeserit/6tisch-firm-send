@@ -122,11 +122,12 @@
 /* Normal low-power shared slot period */
 #define ORCHESTRA_CONF_COMMON_SHARED_PERIOD 61
 
-/* Enable sender-based Orchestra unicast slotframe to prevent queue build-up to non-routing neighbors */
-#define ORCHESTRA_CONF_UNICAST_SENDER_BASED 1
+/* Receiver-based unicast is more stable for the supported line topology:
+ * every node listens on its own slot and parents transmit to the child's slot. */
+#define ORCHESTRA_CONF_UNICAST_SENDER_BASED 0
 
-/* Short unicast period to speed up linear topology updates */
-#define ORCHESTRA_CONF_UNICAST_PERIOD 7
+/* Short unicast period to give multi-hop line forwarding more drain capacity. */
+#define ORCHESTRA_CONF_UNICAST_PERIOD 5
 
 /* Orchestra Rules: switch to storing mode unicast rule */
 #undef ORCHESTRA_CONF_RULES
@@ -134,6 +135,6 @@
 
 /* TSCH Queue Size Configuration */
 #define TSCH_QUEUE_CONF_NUM_PER_NEIGHBOR 16
-#define QUEUEBUF_CONF_NUM 16
+#define QUEUEBUF_CONF_NUM 32
 
 #endif /* PROJECT_CONF_H_ */

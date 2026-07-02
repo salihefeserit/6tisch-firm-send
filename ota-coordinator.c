@@ -13,6 +13,22 @@
  */
 PROCESS(distribute_process, "OTA Distribution Process");
 
+static clock_time_t
+ms_to_ticks(unsigned long ms)
+{
+  clock_time_t ticks = (clock_time_t)((CLOCK_SECOND * ms) / 1000);
+  return ticks == 0 ? 1 : ticks;
+}
+
+#define WAIT_FOR_DOWNSTREAM_QUEUE(timer) do {                         \
+  while(!ota_downstream_queue_ready()) {                               \
+    ota_log_downstream_queue_state();                                  \
+    etimer_set(&(timer), ms_to_ticks(OTA_QUEUE_DRAIN_CHECK_MS));       \
+    PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER &&              \
+                             data == &(timer));                        \
+  }                                                                    \
+} while(0)
+
 /* Process thread for distributing a page to all nodes */
 PROCESS_THREAD(distribute_process, ev, data) {
   static struct etimer dist_timer;
@@ -40,6 +56,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
   }
 
   for (dist_chunk_idx = 0; dist_chunk_idx < total_chunks; dist_chunk_idx++) {
+    WAIT_FOR_DOWNSTREAM_QUEUE(dist_timer);
+
     uint32_t chunk_abs_offset = page_start_offset + dist_chunk_idx * 64;
     uint16_t chunk_len = 64;
     if (chunk_abs_offset + chunk_len > page_start_offset + expected_page_size) {
@@ -58,8 +76,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
              dist_chunk_idx + 1, total_chunks, (unsigned long)chunk_abs_offset,
              chunk_len);
 
-    /* Wait for 80 ms to avoid network congestion and queue overflows (optimized for line topology) */
-    etimer_set(&dist_timer, CLOCK_SECOND * 8 / 100);
+    /* Pace chunks for multi-hop line forwarding. */
+    etimer_set(&dist_timer, ms_to_ticks(OTA_DISTRIBUTION_INTERVAL_MS));
     PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
   }
 
@@ -82,8 +100,9 @@ PROCESS_THREAD(distribute_process, ev, data) {
       break;
     }
 
-    if (recovery_round >= 10) {
-      LOG_WARN("Max page recovery rounds (10) reached! Moving to next page anyway.\n");
+    if (recovery_round >= OTA_MAX_PAGE_RECOVERY_ROUNDS) {
+      LOG_WARN("Max page recovery rounds (%u) reached! Moving to next page anyway.\n",
+               OTA_MAX_PAGE_RECOVERY_ROUNDS);
       break;
     }
     recovery_round++;
@@ -105,12 +124,13 @@ PROCESS_THREAD(distribute_process, ev, data) {
     end_pkt.offset = page_start_offset;
     end_pkt.length = page_crc;
     end_pkt.target_slot = ota_target_slot;
+    WAIT_FOR_DOWNSTREAM_QUEUE(dist_timer);
     send_to_all(&end_pkt, FW_PACKET_HEADER_LEN);
     LOG_INFO("Sent PAGE_END for offset 0x%05lx, waiting for bitmap...\n",
              (unsigned long)page_start_offset);
 
-    /* Wait for bitmap reports (or timeout of 15.0 seconds) */
-    etimer_set(&dist_timer, CLOCK_SECOND * 15);
+    /* Wait for bitmap reports. Multi-hop reports need extra drain time. */
+    etimer_set(&dist_timer, CLOCK_SECOND * OTA_PAGE_REPORT_TIMEOUT_SECONDS);
     while (1) {
       PROCESS_WAIT_EVENT();
       if (ev == PROCESS_EVENT_TIMER && data == &dist_timer) {
@@ -161,8 +181,10 @@ PROCESS_THREAD(distribute_process, ev, data) {
         }
         
         LOG_INFO("Sending PAGE_END again...\n");
+        WAIT_FOR_DOWNSTREAM_QUEUE(dist_timer);
         send_to_all(&end_pkt, FW_PACKET_HEADER_LEN);
-        etimer_set(&dist_timer, CLOCK_SECOND * 15);
+        etimer_set(&dist_timer,
+                   CLOCK_SECOND * OTA_PAGE_REPORT_TIMEOUT_SECONDS);
       } else if (ev == event_bitmap_received) {
         /* Double check if all nodes have actually replied in this round to ignore stale events */
         uint8_t all_replied = 1;
@@ -191,6 +213,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
     /* We have missing chunks! Iterate over chunks and count misses */
     LOG_INFO("Analyzing missing chunks for page 0x%05lx...\n", (unsigned long)page_start_offset);
     for (dist_chunk_idx = 0; dist_chunk_idx < total_chunks; dist_chunk_idx++) {
+      WAIT_FOR_DOWNSTREAM_QUEUE(dist_timer);
+
       uint8_t byte_idx = dist_chunk_idx / 8;
       uint8_t bit_idx = dist_chunk_idx % 8;
       uint8_t missed_count = 0;
@@ -219,8 +243,8 @@ PROCESS_THREAD(distribute_process, ev, data) {
                  dist_chunk_idx, (unsigned long)chunk_abs_offset, missed_count);
         send_to_all(&pkt, FW_PACKET_HEADER_LEN + chunk_len);
 
-        /* Wait for 80 ms pacing delay between retransmissions (optimized for line topology) */
-        etimer_set(&dist_timer, CLOCK_SECOND * 8 / 100);
+        /* Recovery traffic is paced slightly slower than the first pass. */
+        etimer_set(&dist_timer, ms_to_ticks(OTA_RECOVERY_INTERVAL_MS));
         PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_TIMER && data == &dist_timer);
       }
     }

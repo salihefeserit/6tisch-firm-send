@@ -14,6 +14,7 @@ static uint8_t page_0_erased = 0;
 static uint8_t ota_session_active = 0;
 static uint16_t running_fw_crc = 0;
 static uint16_t current_image_sec_ver = OTA_START_SEC_VER_UNKNOWN;
+static uint32_t last_crc_committed_page_offset = 0xFFFFFFFFUL;
 
 static struct ctimer report_ctimer;
 static bitmap_report_t report_to_send;
@@ -327,6 +328,7 @@ reset_rx_state(void)
   memset(page_bitmap, 0, sizeof(page_bitmap));
   page_0_erased = 0;
   running_fw_crc = 0;
+  last_crc_committed_page_offset = 0xFFFFFFFFUL;
 }
 
 static void
@@ -471,14 +473,11 @@ handle_page_end(const fw_packet_t *pkt, uint16_t datalen,
 
   if(pkt->offset == current_rx_page_offset) {
     /* Current page is already selected. */
-  } else if(current_rx_page_offset == 0xFFFFFFFFUL && pkt->offset == 0) {
-    current_rx_page_offset = 0;
-    memset(page_bitmap, 0, sizeof(page_bitmap));
-  } else if(pkt->offset > current_rx_page_offset &&
-            current_rx_page_offset != 0xFFFFFFFFUL) {
-    current_rx_page_offset = pkt->offset;
-    memset(page_bitmap, 0, sizeof(page_bitmap));
   } else {
+    LOG_WARN("[OTA] Ignored PAGE_END for page 0x%05lx before DATA "
+             "(current page: 0x%05lx)\n",
+             (unsigned long)pkt->offset,
+             (unsigned long)current_rx_page_offset);
     return;
   }
 
@@ -506,7 +505,14 @@ handle_page_end(const fw_packet_t *pkt, uint16_t datalen,
   if(flash_ok && page_crc == pkt->length) {
     LOG_INFO("[OTA PAGE SUCCESS] CRC matches for page 0x%05lx (0x%04x)\n",
              (unsigned long)current_rx_page_offset, page_crc);
-    running_fw_crc = temp_fw_crc;
+    if(last_crc_committed_page_offset != current_rx_page_offset) {
+      running_fw_crc = temp_fw_crc;
+      last_crc_committed_page_offset = current_rx_page_offset;
+    } else {
+      LOG_INFO("[OTA] Duplicate PAGE_END for page 0x%05lx; cumulative CRC "
+               "already updated\n",
+               (unsigned long)current_rx_page_offset);
+    }
   } else {
     LOG_WARN("[OTA PAGE FAILED] CRC mismatch/flash error for page 0x%05lx! "
              "Expected 0x%04x, got 0x%04x\n",
